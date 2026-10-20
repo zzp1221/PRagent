@@ -108,6 +108,29 @@ def _collect_evidence(observations: List[dict]) -> Dict[str, dict]:
     return values
 
 
+DECISION_FINAL_KEYS = (
+    "delegations", "revision_requests", "findings", "decisions",
+    "accepted_finding_indices", "critic_objective", "resolution_summary",
+)
+
+
+def decision_kind(action: Dict[str, Any]) -> str:
+    """Return 'final' or 'tool', inferring intent when ``action`` is missing.
+
+    Reasoning models occasionally emit the payload of a decision while omitting
+    the discriminator field. The payload itself is unambiguous, so recover the
+    intent instead of failing the whole review.
+    """
+    kind = str(action.get("action", "")).strip().lower()
+    if kind in {"final", "tool"}:
+        return kind
+    if any(key in action for key in DECISION_FINAL_KEYS):
+        return "final"
+    if str(action.get("tool", "")).strip():
+        return "tool"
+    return kind
+
+
 class BoundedRole:
     def __init__(
         self, name: str, prompt: str, client: JsonChatClient,
@@ -132,7 +155,6 @@ class BoundedRole:
     ) -> Dict[str, Any]:
         started = time.monotonic()
         observations: List[dict] = []
-        invalid_actions = 0
         starting_tokens = sum(
             item.input_tokens + item.output_tokens
             for item in ledger.model_calls if item.role == self.name
@@ -185,7 +207,23 @@ class BoundedRole:
                 json.dumps(managed, ensure_ascii=False, default=str),
                 ledger, max_tokens=output_allowance,
             )
-            kind = str(action.get("action", "")).strip().lower()
+            kind = decision_kind(action)
+            # A malformed decision is retried inside the same step. One-shot
+            # phases only allow a single step, so spending it on a retry would
+            # abort the phase instead of recovering from it.
+            reopened = 0
+            while kind not in {"final", "tool"} and reopened < 2:
+                reopened += 1
+                ledger.trace(
+                    self.name, "invalid_action", step=step, action=kind,
+                    raw=json.dumps(action, ensure_ascii=False, default=str)[:500],
+                )
+                action = self.client.complete_json(
+                    self.name, self.prompt,
+                    json.dumps(managed, ensure_ascii=False, default=str),
+                    ledger, max_tokens=output_allowance,
+                )
+                kind = decision_kind(action)
             ledger.trace(
                 self.name, "autonomous_decision", step=step, action=kind,
                 tool=str(action.get("tool", "")), reason=str(action.get("reason", ""))[:500],
@@ -196,16 +234,7 @@ class BoundedRole:
                 ledger.trace(self.name, "finished", step=step)
                 return action
             if kind != "tool":
-                # One malformed answer should not fail the whole review: retry
-                # once, then give up loudly so the failure stays visible.
-                invalid_actions += 1
-                ledger.trace(
-                    self.name, "invalid_action", step=step, action=kind,
-                    raw=json.dumps(action, ensure_ascii=False, default=str)[:500],
-                )
-                if invalid_actions > 1:
-                    raise ValueError("%s returned an invalid action" % self.name)
-                continue
+                raise ValueError("%s returned an invalid action" % self.name)
             tool_name = str(action.get("tool", ""))
             arguments = action.get("arguments") or {}
             try:
