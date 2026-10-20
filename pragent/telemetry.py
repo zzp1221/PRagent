@@ -44,6 +44,8 @@ class ExecutionLedger:
         # evidence_id -> producing tool, so a finding cannot cite an observation
         # that this review never made.
         self.evidence: Dict[str, str] = {}
+        # evidence_id -> the file that observation was about, when it was scoped.
+        self.evidence_subjects: Dict[str, str] = {}
         self._lock = threading.Lock()
 
     def estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
@@ -83,9 +85,15 @@ class ExecutionLedger:
         with self._lock:
             self.tool_calls.append(call)
 
-    def record_evidence(self, evidence_id: str, tool: str) -> None:
+    def record_evidence(self, evidence_id: str, tool: str, subject: str = "") -> None:
         with self._lock:
             self.evidence[str(evidence_id)] = str(tool)
+            if subject:
+                self.evidence_subjects[str(evidence_id)] = str(subject)
+
+    def evidence_subject(self, evidence_id: str) -> str:
+        with self._lock:
+            return self.evidence_subjects.get(str(evidence_id), "")
 
     def has_evidence(self, evidence_id: str, tool: str = "") -> bool:
         with self._lock:
@@ -123,11 +131,16 @@ class ExecutionLedger:
             str(key): str(value)
             for key, value in (summary.get("evidence") or {}).items()
         }
+        subjects = {
+            str(key): str(value)
+            for key, value in (summary.get("evidence_subjects") or {}).items()
+        }
         with self._lock:
             self.model_calls = models
             self.tool_calls = tools
             self.agent_traces = traces
             self.evidence = evidence
+            self.evidence_subjects = subjects
 
     def summary(self, include_trace: bool = True) -> Dict[str, Any]:
         with self._lock:
@@ -135,6 +148,7 @@ class ExecutionLedger:
             tools = [asdict(item) for item in self.tool_calls]
             traces = {key: list(value) for key, value in self.agent_traces.items()}
             evidence = dict(self.evidence)
+            subjects = dict(self.evidence_subjects)
         return {
             "mode": self.mode,
             "llm_calls": len(models),
@@ -151,5 +165,6 @@ class ExecutionLedger:
             "model_call_log": models,
             "tool_call_log": tools,
             "evidence": evidence,
+            "evidence_subjects": subjects,
             "agent_traces": traces if include_trace else {},
         }

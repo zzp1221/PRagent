@@ -126,6 +126,51 @@ class EvidenceGateTests(unittest.TestCase):
 
         self.assertEqual(1, len(result.accepted))
 
+    def test_evidence_from_another_file_cannot_back_this_finding(self):
+        ledger = ExecutionLedger("agentic")
+        ledger.record_evidence("ast_analyze:abc123", "ast_analyze", "b.py")
+        finding = _finding([
+            {"evidence_id": "ast_analyze:abc123", "tool": "ast_analyze"},
+        ])
+
+        result = self.gate.apply([finding], self.parsed, ledger)
+
+        self.assertEqual([], result.accepted)
+        self.assertEqual(1, result.checks["evidence"]["unverified_refs"])
+
+    def test_evidence_scoped_to_the_same_file_is_accepted(self):
+        ledger = ExecutionLedger("agentic")
+        ledger.record_evidence("ast_analyze:abc123", "ast_analyze", "a.py")
+        finding = _finding([
+            {"evidence_id": "ast_analyze:abc123", "tool": "ast_analyze"},
+        ])
+
+        result = self.gate.apply([finding], self.parsed, ledger)
+
+        self.assertEqual(1, len(result.accepted))
+        self.assertEqual(1, result.accepted[0].gate["strong_evidence_count"])
+
+    def test_unscoped_tool_evidence_is_not_position_checked(self):
+        ledger = ExecutionLedger("agentic")
+        ledger.record_evidence("run_scanners:abc123", "run_scanners")
+        finding = _finding([
+            {"evidence_id": "run_scanners:abc123", "tool": "run_scanners"},
+        ])
+
+        result = self.gate.apply([finding], self.parsed, ledger)
+
+        self.assertEqual(1, len(result.accepted))
+
+    def test_tool_wrapper_records_the_file_scope_of_an_observation(self):
+        ledger = ExecutionLedger("agentic")
+        suite = RepositoryToolSuite("", DIFF, self.parsed, ledger)
+        value = suite.registry("security").invoke(
+            "changed_line", {"path": "a.py", "line": 1},
+        )
+
+        self.assertEqual("a.py", ledger.evidence_subject(value["evidence_id"]))
+        self.assertTrue(ledger.has_evidence(value["evidence_id"], "changed_line"))
+
     def test_checkpoint_restore_preserves_recorded_evidence(self):
         ledger = ExecutionLedger("agentic")
         ledger.record_evidence("symbol:abc", "symbol")

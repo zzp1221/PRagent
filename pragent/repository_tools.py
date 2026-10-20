@@ -54,13 +54,21 @@ class RepositoryToolSuite:
     def repository_available(self) -> bool:
         return bool(self.root)
 
-    def _remember_evidence(self, tool: str, value: Any) -> None:
+    def _remember_evidence(
+        self, tool: str, value: Any, arguments: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Record the evidence id a tool produced so the gate can verify citations."""
         if self.ledger is None or not isinstance(value, dict):
             return
         evidence_id = value.get("evidence_id")
-        if evidence_id:
-            self.ledger.record_evidence(str(evidence_id), tool)
+        if not evidence_id:
+            return
+        subject = ""
+        if isinstance(arguments, dict):
+            path = arguments.get("path")
+            if isinstance(path, str) and path:
+                subject = path
+        self.ledger.record_evidence(str(evidence_id), tool, subject)
 
     def _safe_path(self, relative: str) -> str:
         if not self.root:
@@ -427,7 +435,7 @@ class RepositoryToolSuite:
                             role, _name, arguments, True,
                             int((time.monotonic() - started) * 1000), value,
                         )
-                        self._remember_evidence(_name, value)
+                        self._remember_evidence(_name, value, arguments)
                     return value
                 except Exception as exc:
                     if self.ledger:

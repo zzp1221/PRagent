@@ -25,6 +25,10 @@ class FindingGate:
         "diff-ast-analyze": "diff-ast",
     }
     RULE_EVIDENCE_TOOL = "local-rule-scanner"
+    # Tools whose call is bound to one file, so their evidence covers that file only.
+    PATH_SCOPED_EVIDENCE_TOOLS = {
+        "read_file", "ast_analyze", "git_context", "changed_line", "locate_tests",
+    }
 
     def __init__(self, minimum_confidence: float = 0.55):
         self.minimum_confidence = minimum_confidence
@@ -60,6 +64,10 @@ class FindingGate:
         ).hexdigest()[:16]
         return str(item.get("evidence_id")) == expected
 
+    @staticmethod
+    def _path_key(value: str) -> str:
+        return str(value).replace("\\", "/").lstrip("./")
+
     def _verified_refs(
         self, finding: Finding, valid_locations: Dict[Tuple[str, int], str],
         ledger: Optional[Any],
@@ -82,10 +90,17 @@ class FindingGate:
                 if not self._rule_evidence_matches(item, finding, valid_locations):
                     unverified += 1
                     continue
-            elif ledger is not None and not ledger.has_evidence(evidence_id, tool):
-                # No such tool observation exists in this review's ledger.
-                unverified += 1
-                continue
+            elif ledger is not None:
+                if not ledger.has_evidence(evidence_id, tool):
+                    # No such tool observation exists in this review's ledger.
+                    unverified += 1
+                    continue
+                if tool in self.PATH_SCOPED_EVIDENCE_TOOLS:
+                    subject = ledger.evidence_subject(evidence_id)
+                    if subject and self._path_key(subject) != self._path_key(finding.path):
+                        # Evidence gathered from another file cannot back this one.
+                        unverified += 1
+                        continue
             verified.append(item)
         return verified, unverified
 
