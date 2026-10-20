@@ -18,6 +18,21 @@ DIFF = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
 ISSUE_URL = "https://api.github.com/repos/org/repo/issues/7"
 
 
+def _remove_database(path: str) -> None:
+    """Delete a temporary database, retrying transient Windows handle contention.
+
+    A lease heartbeat thread may still be finishing its last write when the test
+    ends; on Windows that briefly blocks the unlink.
+    """
+    for _ in range(5):
+        try:
+            os.unlink(path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    os.unlink(path)
+
+
 class TaskLeaseStoreTests(unittest.TestCase):
     def setUp(self):
         handle, self.path = tempfile.mkstemp(suffix=".db")
@@ -25,7 +40,7 @@ class TaskLeaseStoreTests(unittest.TestCase):
         self.store = TaskStore(self.path)
 
     def tearDown(self):
-        os.unlink(self.path)
+        _remove_database(self.path)
 
     def _task(self, task_id="task-1"):
         self.store.create(task_id, "org/repo", 1, {"source": "test"})
@@ -67,7 +82,7 @@ class QueuedDeliveryTests(unittest.TestCase):
         os.close(handle)
 
     def tearDown(self):
-        os.unlink(self.path)
+        _remove_database(self.path)
 
     def _service(self):
         settings = Settings(
@@ -200,7 +215,7 @@ class LeaseFencingTests(unittest.TestCase):
         self.store = TaskStore(self.path)
 
     def tearDown(self):
-        os.unlink(self.path)
+        _remove_database(self.path)
 
     def _task(self, task_id="fence-1"):
         self.store.create(task_id, "org/repo", 1, {"source": "test"})
@@ -276,7 +291,7 @@ class WebhookDispatchTests(unittest.TestCase):
         os.close(handle)
 
     def tearDown(self):
-        os.unlink(self.path)
+        _remove_database(self.path)
 
     def _service(self):
         settings = Settings(

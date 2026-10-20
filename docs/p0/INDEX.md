@@ -60,6 +60,10 @@ python -c "import sys,pathlib,unittest; sys.path.insert(0,'.'); sys.path.insert(
 会话开始时：70 用例，45 失败（39 个 Windows 文件锁、5 个缺数据集、1 个 `ast.unparse` 引号断言）。
 现在：**110 用例，0 失败**。新增 40 个用例，全部通过。
 
+验证方法：全量运行 4 次、`test_queue_reliability` 单独运行 5 次。其中一次全量出现过 1 个
+无法复现的错误（其余 8 次全绿），已在新增测试的临时库清理里加入针对 Windows 瞬时句柄
+占用的重试。既有测试文件未改动，它们的失败此前已由连接修复解决。
+
 注意：项目没有 `tests/__init__.py`，`python -m unittest discover -s tests` 在 Python 3.14 下
 会报 `Start directory is not importable`，请用上面的按模块名加载方式（或 `pytest`）。
 
