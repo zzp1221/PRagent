@@ -25,7 +25,7 @@ from .reviewer import (
 from .skills import AgentSkill, SkillRegistry
 from .skill_evolution import AgentSkillReplayReviewer, SkillEvolutionEngine, validate_artifact
 from .store import utc_now
-from .task_lease import TaskLease
+from .task_lease import LeaseLost, TaskLease
 from .task_queue import PermanentTaskError, TaskQueue
 from .rollout import ReleaseManager
 from .verifier import RepairVerifier
@@ -186,9 +186,11 @@ class ReviewService:
 
     def _run_review(
         self, task_id: str, repository: str, pull_request: Optional[int],
-        diff: str, tenant_id: str,
+        diff: str, tenant_id: str, fence=None,
     ):
-        return self.harness.run(task_id, repository, pull_request, diff, tenant_id)
+        return self.harness.run(
+            task_id, repository, pull_request, diff, tenant_id, fence,
+        )
 
     def reload_skills(self) -> list:
         if self.llm_config:
@@ -367,7 +369,10 @@ class ReviewService:
             metrics.inc("review_queue_contended_total")
             return
         try:
-            self._process_leased(payload, task, tenant_id, task_id)
+            self._process_leased(payload, task, tenant_id, task_id, lease.fence)
+        except LeaseLost:
+            # Another worker owns the task now and will produce the result.
+            metrics.inc("review_lease_lost_total")
         finally:
             if lease.lost:
                 metrics.inc("review_lease_lost_total")
@@ -375,7 +380,7 @@ class ReviewService:
 
     def _process_leased(
         self, payload: Dict[str, Any], task: Dict[str, Any],
-        tenant_id: str, task_id: str,
+        tenant_id: str, task_id: str, fence=None,
     ) -> None:
         diff = self.store.get_task_payload(task_id)
         if diff is None and payload.get("diff_url"):
@@ -400,7 +405,7 @@ class ReviewService:
             ), metrics.timer("review_duration"):
                 report = self._run_review(
                     task_id, payload["repository"], payload.get("pull_request"), diff,
-                    tenant_id,
+                    tenant_id, fence,
                 )
             metrics.inc("reviews_total")
             lane = (task.get("input") or {}).get("release_lane", "stable")
@@ -417,6 +422,8 @@ class ReviewService:
                     ),
                 )
                 metrics.inc("github_comments_%s" % action)
+        except LeaseLost:
+            raise
         except Exception:
             metrics.inc("reviews_failed_total")
             lane = (task.get("input") or {}).get("release_lane", "stable")

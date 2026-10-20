@@ -4,10 +4,12 @@ import time
 import unittest
 
 from pragent.config import Settings
-from pragent.models import TaskState, TraceEvent
+from pragent.harness import ReviewHarness
+from pragent.models import ReviewReport, TaskState, TraceEvent
+from pragent.reviewer import LocalRuleReviewer
 from pragent.service import ReviewService
 from pragent.store import TaskStore
-from pragent.task_lease import TaskLease
+from pragent.task_lease import LeaseLost, TaskLease
 from pragent.task_queue import TaskQueue
 from agentic_fake import enable_agentic_service
 
@@ -189,6 +191,70 @@ class PelHeartbeatTests(unittest.TestCase):
             queue.close()
         self.assertEqual([{"task_id": "m1"}], seen)
         self.assertEqual(["7-0"], queue._redis.acked)
+
+
+class LeaseFencingTests(unittest.TestCase):
+    def setUp(self):
+        handle, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        self.store = TaskStore(self.path)
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def _task(self, task_id="fence-1"):
+        self.store.create(task_id, "org/repo", 1, {"source": "test"})
+        return task_id
+
+    @staticmethod
+    def _event(state=TaskState.SUCCESS):
+        return TraceEvent(1, state, "done", "2026-01-01T00:00:00+00:00")
+
+    def test_stale_fence_cannot_overwrite_the_new_owner_result(self):
+        task_id = self._task()
+        token_a = self.store.acquire_task_lease(task_id, "worker-a", 1)
+        time.sleep(1.2)
+        token_b = self.store.acquire_task_lease(task_id, "worker-b", 60)
+        self.assertEqual(2, token_b)
+
+        self.assertFalse(self.store.succeed(
+            task_id, ReviewReport("org/repo", 1, "stale result", "low"),
+            self._event(), ("worker-a", token_a),
+        ))
+        self.assertTrue(self.store.succeed(
+            task_id, ReviewReport("org/repo", 1, "current result", "low"),
+            self._event(), ("worker-b", token_b),
+        ))
+        self.assertEqual("current result", self.store.get(task_id)["report"]["summary"])
+
+    def test_transition_requires_the_current_fence(self):
+        task_id = self._task()
+
+        self.assertFalse(self.store.transition(
+            task_id, self._event(TaskState.PLANNING), ("nobody", 1),
+        ))
+        self.assertEqual("PENDING", self.store.get(task_id)["state"])
+        self.assertTrue(self.store.transition(
+            task_id, self._event(TaskState.PLANNING),
+        ))
+        self.assertEqual("PLANNING", self.store.get(task_id)["state"])
+
+    def test_writes_without_a_fence_are_unchanged(self):
+        task_id = self._task()
+
+        self.assertTrue(self.store.succeed(
+            task_id, ReviewReport("org/repo", 1, "synchronous", "low"), self._event(),
+        ))
+        self.assertEqual("SUCCESS", self.store.get(task_id)["state"])
+
+    def test_review_aborts_when_the_fence_no_longer_matches(self):
+        task_id = self._task()
+        harness = ReviewHarness(self.store, LocalRuleReviewer(), 8, 10)
+
+        with self.assertRaises(LeaseLost):
+            harness.run(task_id, "org/repo", 1, DIFF, "default", ("nobody", 1))
+
+        self.assertEqual("PENDING", self.store.get(task_id)["state"])
 
 
 def _webhook_payload(number=7):

@@ -8,10 +8,10 @@ import hashlib
 import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from .models import ReviewReport, TaskState, TraceEvent
-from .store import TERMINAL_STATES, lease_deadline, utc_now
+from .store import TERMINAL_STATES, fence_clause, lease_deadline, utc_now
 
 
 class PostgresTaskStore:
@@ -196,34 +196,54 @@ class PostgresTaskStore:
             )
             return cursor.rowcount == 1
 
-    def transition(self, task_id: str, event: TraceEvent) -> None:
+    def _write_state(
+        self, conn, task_id: str, query: str, params: list,
+        event: TraceEvent, fence,
+    ) -> bool:
+        suffix, fence_params = fence_clause(fence, "%s")
+        cursor = conn.execute(query + suffix, params + fence_params)
+        if cursor.rowcount != 1:
+            # Someone else owns the task now; this executor must not write.
+            return False
+        conn.execute(
+            "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
+            (task_id, event.step, event.state.value, event.message, event.created_at),
+        )
+        return True
+
+    def transition(
+        self, task_id: str, event: TraceEvent, fence: Optional[Tuple[str, int]] = None,
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute("UPDATE tasks SET state=%s,updated_at=%s WHERE id=%s", (event.state.value, event.created_at, task_id))
-            conn.execute(
-                "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
-                (task_id, event.step, event.state.value, event.message, event.created_at),
+            return self._write_state(
+                conn, task_id,
+                "UPDATE tasks SET state=%s,updated_at=%s WHERE id=%s",
+                [event.state.value, event.created_at, task_id], event, fence,
             )
 
-    def succeed(self, task_id: str, report: ReviewReport, event: TraceEvent) -> None:
+    def succeed(
+        self, task_id: str, report: ReviewReport, event: TraceEvent,
+        fence: Optional[Tuple[str, int]] = None,
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute(
+            return self._write_state(
+                conn, task_id,
                 "UPDATE tasks SET state=%s,report_json=%s::jsonb,updated_at=%s WHERE id=%s",
-                (TaskState.SUCCESS.value, json.dumps(report.to_dict(), ensure_ascii=False), event.created_at, task_id),
-            )
-            conn.execute(
-                "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
-                (task_id, event.step, event.state.value, event.message, event.created_at),
+                [TaskState.SUCCESS.value,
+                 json.dumps(report.to_dict(), ensure_ascii=False), event.created_at, task_id],
+                event, fence,
             )
 
-    def fail(self, task_id: str, error: str, event: TraceEvent) -> None:
+    def fail(
+        self, task_id: str, error: str, event: TraceEvent,
+        fence: Optional[Tuple[str, int]] = None,
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute(
+            return self._write_state(
+                conn, task_id,
                 "UPDATE tasks SET state=%s,error=%s,updated_at=%s WHERE id=%s",
-                (TaskState.FAILED.value, error[:2000], event.created_at, task_id),
-            )
-            conn.execute(
-                "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
-                (task_id, event.step, event.state.value, event.message, event.created_at),
+                [TaskState.FAILED.value, error[:2000], event.created_at, task_id],
+                event, fence,
             )
 
     def get(self, task_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -743,16 +763,15 @@ class PostgresTaskStore:
             ).fetchone()
         return bool(row and row["cancel_requested"])
 
-    def cancel(self, task_id: str, event: TraceEvent) -> None:
+    def cancel(
+        self, task_id: str, event: TraceEvent,
+        fence: Optional[Tuple[str, int]] = None,
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute(
+            return self._write_state(
+                conn, task_id,
                 "UPDATE tasks SET state=%s,updated_at=%s WHERE id=%s",
-                (TaskState.CANCELLED.value, event.created_at, task_id),
-            )
-            conn.execute(
-                "INSERT INTO trace_events(task_id,step,state,message,created_at) "
-                "VALUES (%s,%s,%s,%s,%s)",
-                (task_id, event.step, event.state.value, event.message, event.created_at),
+                [TaskState.CANCELLED.value, event.created_at, task_id], event, fence,
             )
 
     def create_webhook_task(

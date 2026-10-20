@@ -9,6 +9,7 @@ from .runtime import (
     AgentRuntime, RuntimeBudgetExceeded, RuntimeCancelled, RuntimeNode,
 )
 from .store import TaskStore, utc_now
+from .task_lease import LeaseLost
 
 
 ALLOWED = {
@@ -53,7 +54,7 @@ class ReviewHarness:
 
     def run(
         self, task_id: str, repository: str, pull_request: Optional[int], diff: str,
-        tenant_id: str = "default",
+        tenant_id: str = "default", fence=None,
     ) -> ReviewReport:
         task = self.store.get(task_id)
         if task and task.get("state") == TaskState.SUCCESS.value and task.get("report"):
@@ -64,6 +65,7 @@ class ReviewHarness:
         }
         self._ctx.step = max([item["step"] for item in (task or {}).get("trace", [])] or [0])
         self._ctx.task_id = task_id
+        self._ctx.fence = fence
         checkpoints = self.store.load_checkpoints(task_id)
         self._ctx.state = TaskState.PENDING
         if checkpoints.get("planning", {}).get("status") == "completed":
@@ -86,22 +88,31 @@ class ReviewHarness:
             )
             report = self._report_from_dict(result["report"])
             self._ctx.step += 1
-            self.store.succeed(
+            written = self.store.succeed(
                 task_id, report,
                 TraceEvent(self._ctx.step, TaskState.SUCCESS, "Review completed", utc_now()),
+                fence,
             )
+            if not written:
+                # The lease moved on while this review was running, so the
+                # result belongs to nobody: drop it instead of overwriting.
+                raise LeaseLost("task %s is owned by another executor" % task_id)
             return report
         except TaskCancelled as exc:
             self._ctx.step += 1
             self.store.cancel(
-                task_id, TraceEvent(self._ctx.step, TaskState.CANCELLED, str(exc), utc_now())
+                task_id, TraceEvent(self._ctx.step, TaskState.CANCELLED, str(exc), utc_now()),
+                fence,
             )
+            raise
+        except LeaseLost:
             raise
         except Exception as exc:
             self._ctx.step += 1
             self.store.fail(
                 task_id, str(exc),
                 TraceEvent(self._ctx.step, TaskState.FAILED, "Review failed: %s" % exc, utc_now()),
+                fence,
             )
             try:
                 self.store.record_failure_case(
@@ -113,9 +124,9 @@ class ReviewHarness:
 
     def resume(
         self, task_id: str, repository: str, pull_request: Optional[int], diff: str,
-        tenant_id: str = "default",
+        tenant_id: str = "default", fence=None,
     ) -> ReviewReport:
-        return self.run(task_id, repository, pull_request, diff, tenant_id)
+        return self.run(task_id, repository, pull_request, diff, tenant_id, fence)
 
     def _planning(self, state: RuntimeState) -> Dict[str, Any]:
         parsed = parse_unified_diff(state["diff"])
@@ -177,10 +188,12 @@ class ReviewHarness:
             )
         self._ctx.step += 1
         self._ctx.state = target
-        self.store.transition(
+        if not self.store.transition(
             self._ctx.task_id,
             TraceEvent(self._ctx.step, target, message, utc_now()),
-        )
+            getattr(self._ctx, "fence", None),
+        ):
+            raise LeaseLost("task %s is owned by another executor" % self._ctx.task_id)
 
     def _span(self, name: str, attributes: Dict[str, Any]):
         if self.observability:

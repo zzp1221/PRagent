@@ -2,7 +2,11 @@
 import socket
 import threading
 import uuid
-from typing import Optional
+from typing import Optional, Tuple
+
+
+class LeaseLost(RuntimeError):
+    """Raised when an executor tries to write after losing the task lease."""
 
 
 class TaskLease:
@@ -27,6 +31,13 @@ class TaskLease:
     @property
     def held(self) -> bool:
         return self.token is not None
+
+    @property
+    def fence(self) -> Optional[Tuple[str, int]]:
+        """Identity a write must present to prove it still owns the task."""
+        if self.token is None:
+            return None
+        return (self.owner, int(self.token))
 
     def _interval(self) -> float:
         return max(0.05, self.lease_seconds / 3.0)
