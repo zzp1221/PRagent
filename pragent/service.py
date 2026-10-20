@@ -531,6 +531,8 @@ class ReviewService:
                 "diff_url": diff_url,
                 "github_issue_url": pull.get("issue_url", ""),
                 "installation_id": installation_id,
+                "head_sha": (pull.get("head") or {}).get("sha", ""),
+                "base_sha": (pull.get("base") or {}).get("sha", ""),
             },
         )
         self.queue.submit({
@@ -570,6 +572,7 @@ class ReviewService:
         result = self.fixer.create_fix_commits(
             self.github_client_for_installation(installation_id),
             task["repository"], task["pull_request"], task["report"],
+            expected_sha=str((task.get("input") or {}).get("head_sha") or ""),
         )
         metrics.inc("fix_runs_total")
         return result

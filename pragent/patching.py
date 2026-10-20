@@ -128,10 +128,18 @@ class VerifiedPatchFixer:
 
     def create_fix_commits(
         self, client, repository: str, pull_request: int, report: dict,
+        expected_sha: str = "",
     ) -> dict:
         pull = client.get_pull_request(repository, pull_request)
-        source_ref = pull["head"]["ref"]
         source_sha = pull["head"]["sha"]
+        if expected_sha and expected_sha != source_sha:
+            # The report describes an older commit; patching the newer one would
+            # either fail on context or silently edit the wrong lines.
+            return {
+                "status": "stale", "branch": None, "commits": [],
+                "reviewed_sha": expected_sha, "current_sha": source_sha,
+                "note": "The pull request moved on after the review. Re-run the review before fixing.",
+            }
         source_repository = pull["head"].get("repo", {}).get("full_name") or repository
         paths = sorted({
             str(item.get("path")) for item in report.get("findings", [])
@@ -142,8 +150,10 @@ class VerifiedPatchFixer:
                     "note": "No verified finding is eligible for patch generation."}
         originals = {}
         for path in paths:
+            # Read from the immutable commit, the same one used for the archive
+            # below; a branch ref would give two different baselines.
             originals[path] = client.get_file(
-                source_repository, path, source_ref
+                source_repository, path, source_sha
             )["decoded_content"]
         ledger = ExecutionLedger("fix-agent")
         generated = self.client.complete_json(
@@ -226,7 +236,9 @@ class VerifiedPatchFixer:
 
 
 class SuggestionOnlyFixer:
-    def create_fix_commits(self, client, repository, pull_request, report):
+    def create_fix_commits(
+        self, client, repository, pull_request, report, expected_sha="",
+    ):
         return {
             "status": "suggestion-only", "branch": None, "commits": [],
             "suggestions": [item.get("fix", "") for item in report.get("findings", [])],
