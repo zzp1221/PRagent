@@ -1,0 +1,88 @@
+name: pragent
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PRAGENT_POSTGRES_DB:-pragent}
+      POSTGRES_USER: ${PRAGENT_POSTGRES_USER:-pragent}
+      POSTGRES_PASSWORD: ${PRAGENT_POSTGRES_PASSWORD:-pragent-local}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${PRAGENT_POSTGRES_USER:-pragent} -d ${PRAGENT_POSTGRES_DB:-pragent}",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    logging: *default-logging
+
+  pragent:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11-slim}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: pragent:local
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${PRAGENT_HTTP_PORT:-8080}:8080"
+    environment:
+      # Container-internal values win over .env so a host-oriented .env cannot
+      # bind the server to 127.0.0.1 or fall back to SQLite by accident.
+      PRAGENT_HOST: 0.0.0.0
+      PRAGENT_PORT: "8080"
+      PRAGENT_DB_PATH: /app/data/pragent.db
+      PRAGENT_SKILLS_DIR: /app/skills
+      PRAGENT_DATABASE_URL: postgresql://${PRAGENT_POSTGRES_USER:-pragent}:${PRAGENT_POSTGRES_PASSWORD:-pragent-local}@postgres:5432/${PRAGENT_POSTGRES_DB:-pragent}
+      PRAGENT_REDIS_URL: redis://redis:6379/0
+      PRAGENT_ASYNC_WORKERS: ${PRAGENT_ASYNC_WORKERS:-4}
+      PRAGENT_AUTH_REQUIRED: ${PRAGENT_AUTH_REQUIRED:-true}
+      PRAGENT_AUTH_SECRET: ${PRAGENT_AUTH_SECRET:-dev-only-insecure-secret-change-me-32bytes}
+      PRAGENT_BOOTSTRAP_ADMIN_USERNAME: ${PRAGENT_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      PRAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${PRAGENT_BOOTSTRAP_ADMIN_PASSWORD:-pragent-local-admin}
+      PRAGENT_PUBLIC_BASE_URL: ${PRAGENT_PUBLIC_BASE_URL:-http://127.0.0.1:8080}
+    env_file:
+      # Optional: model keys, GitHub credentials, budgets and the rest of
+      # .env.example are injected here. Values above take precedence.
+      - path: .env
+        required: false
+    volumes:
+      - pragent_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging: *default-logging
+
+volumes:
+  postgres_data:
+  redis_data:
+  pragent_data:

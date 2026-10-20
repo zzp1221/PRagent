@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-journal
+*.sqlite3
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets: .env holds real API keys, passwords and the webhook secret.
+.env
+.env.*
+!.env.example
+*.bak
+*.bak.*
+
+# Runtime artifacts
+data/
+.task_id
+nohup.out

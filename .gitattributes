@@ -1,0 +1,10 @@
+# Normalize every text file to LF so the Dockerfile, shell scripts and
+# containers behave identically on Windows and Linux checkouts.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
