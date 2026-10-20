@@ -132,6 +132,7 @@ class BoundedRole:
     ) -> Dict[str, Any]:
         started = time.monotonic()
         observations: List[dict] = []
+        invalid_actions = 0
         starting_tokens = sum(
             item.input_tokens + item.output_tokens
             for item in ledger.model_calls if item.role == self.name
@@ -195,7 +196,16 @@ class BoundedRole:
                 ledger.trace(self.name, "finished", step=step)
                 return action
             if kind != "tool":
-                raise ValueError("%s returned an invalid action" % self.name)
+                # One malformed answer should not fail the whole review: retry
+                # once, then give up loudly so the failure stays visible.
+                invalid_actions += 1
+                ledger.trace(
+                    self.name, "invalid_action", step=step, action=kind,
+                    raw=json.dumps(action, ensure_ascii=False, default=str)[:500],
+                )
+                if invalid_actions > 1:
+                    raise ValueError("%s returned an invalid action" % self.name)
+                continue
             tool_name = str(action.get("tool", ""))
             arguments = action.get("arguments") or {}
             try:
