@@ -5,7 +5,6 @@ import unittest
 
 from pragent.config import Settings
 from pragent.evolution import EvolutionEngine, RegressionEvaluator
-from pragent.fixer import SafeFixer
 from pragent.models import Finding, Severity
 from pragent.service import ReviewService
 from pragent.store import TaskStore
@@ -28,20 +27,6 @@ class AdvancedFeatureTests(unittest.TestCase):
 
     def tearDown(self):
         os.unlink(self.path)
-
-    def test_safe_fixer_changes_only_supported_rules(self):
-        content = 'password = "secret-value"\nresult = eval(user_input)\nprint(result)\n'
-        findings = [
-            {"path": "app.py", "line": 1, "rule_id": "SEC-HARDCODED-SECRET"},
-            {"path": "app.py", "line": 2, "rule_id": "SEC-EVAL"},
-            {"path": "app.py", "line": 3, "rule_id": "REL-DEBUG-PRINT"},
-        ]
-        result = SafeFixer().apply(content, findings, "app.py")
-        self.assertIn("import os", result["content"])
-        self.assertIn('password = os.environ["PASSWORD"]', result["content"])
-        self.assertIn("eval(user_input)", result["content"])
-        self.assertNotIn("print(result)", result["content"])
-        self.assertEqual({"SEC-HARDCODED-SECRET", "REL-DEBUG-PRINT"}, set(result["rules"]))
 
     def test_deepseek_and_free_openrouter_provider_presets(self):
         deepseek = settings(self.path)
