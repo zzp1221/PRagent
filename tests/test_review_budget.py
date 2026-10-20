@@ -237,7 +237,7 @@ class ReviewBudgetIntegrationTests(unittest.TestCase):
             service.queue.close()
         budget = result["report"]["execution"]["review_budget"]
         self.assertEqual(48000, budget["token_budget"])
-        self.assertEqual(240, budget["time_budget_seconds"])
+        self.assertEqual(480, budget["time_budget_seconds"])
         self.assertEqual("", budget["exhausted"])
         self.assertGreater(budget["model_calls"], 0)
         self.assertGreater(budget["tokens_used"], 0)

@@ -49,8 +49,11 @@ tokens 与角色，是唯一真相源。`ReviewBudget` 只持上限并读账本�
 - 没有仓库时给工具只会产生一串 `repository checkout is unavailable` 的失败观测，纯烧预算。
 
 **默认上限由现有配置推导**，不引入新的必填项：token 为 `agent_token_budget × 6`
-（四个角色加返工余量），时间为 `agent_time_budget_seconds × 4`，调用次数默认不限
+（四个角色加返工余量），时间为 `agent_time_budget_seconds × 8`，调用次数默认不限
 （token 已是主约束）。三项都可用环境变量显式覆盖。
+
+时间系数取 8 而不是 4：一次审查有五到九次模型调用，每次都可能用满角色级时间预算，
+系数 4 会在慢速提供方上于审查中途误杀。系数 8 仍能拦住失控的审查。
 
 ## 约束
 

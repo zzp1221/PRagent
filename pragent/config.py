@@ -147,8 +147,11 @@ class Settings:
             "review_token_budget": (
                 self.agent_review_token_budget or self.agent_token_budget * 6
             ),
+            # A review makes five to nine model calls, each allowed the full
+            # per-role time budget, so a x4 default would abort a slow provider
+            # mid-review. x8 still bounds a runaway review.
             "review_time_budget_seconds": (
-                self.agent_review_time_budget_seconds or self.agent_time_budget_seconds * 4
+                self.agent_review_time_budget_seconds or self.agent_time_budget_seconds * 8
             ),
             "review_max_model_calls": self.agent_review_max_model_calls,
         }

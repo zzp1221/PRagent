@@ -141,7 +141,8 @@ $env:PRAGENT_AGENT_REVIEW_TOKEN_BUDGET = '120000' # 整次审查（所有角色+
 角色级预算约束不了整次审查：Lead 有多个阶段，Worker 可能返工，Critic 还要再调用一次。
 `PRAGENT_AGENT_REVIEW_TOKEN_BUDGET`、`PRAGENT_AGENT_REVIEW_TIME_BUDGET_SECONDS`、
 `PRAGENT_AGENT_REVIEW_MAX_MODEL_CALLS` 是整次审查共享的硬上限，耗尽即中止并把原因写进任务错误与
-`execution.review_budget`。留 0 时按角色预算推导（tokens ×6、秒数 ×4），调用次数不限。
+`execution.review_budget`。留 0 时按角色预算推导（tokens ×6、秒数 ×8，覆盖五到九次调用的正常
+范围），调用次数不限。
 
 需要完全关闭思考（结构化 JSON 任务通常足够）时设 `PRAGENT_LLM_THINKING=disabled`。这两个参数默认不发送，非 DeepSeek 的 OpenAI 兼容端点不受影响。
 
