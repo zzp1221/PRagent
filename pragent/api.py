@@ -572,6 +572,10 @@ class ApiHandler(BaseHTTPRequestHandler):
 def run() -> None:
     settings = Settings.from_env()
     service = ReviewService(settings)
+    # Tasks created before a crash may never have reached the queue.
+    recovered = service.redispatch_pending()
+    if recovered["redispatched"]:
+        print("Re-queued %d undispatched task(s)" % len(recovered["redispatched"]))
     handler = type("ConfiguredApiHandler", (ApiHandler,), {"service": service, "settings": settings})
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
     print("PRAgent dashboard: http://%s:%d" % (settings.host, settings.port))

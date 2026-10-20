@@ -6,10 +6,12 @@ dependency so local development can remain zero-config.
 """
 import hashlib
 import json
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from .models import ReviewReport, TaskState, TraceEvent
-from .store import utc_now
+from .store import TERMINAL_STATES, lease_deadline, utc_now
 
 
 class PostgresTaskStore:
@@ -24,8 +26,16 @@ class PostgresTaskStore:
         self.url = url
         self._init()
 
+    @contextmanager
     def _connect(self):
-        return self.psycopg.connect(self.url, row_factory=self.dict_row)
+        # Closing is explicit: the connection context manager only settles the
+        # transaction, so without this every store call leaks a pool slot.
+        conn = self.psycopg.connect(self.url, row_factory=self.dict_row)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init(self) -> None:
         statements = [
@@ -72,6 +82,9 @@ class PostgresTaskStore:
             "ALTER TABLE skill_evolution_runs ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lease_owner TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lease_token INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
             "ALTER TABLE installations ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
             """CREATE TABLE IF NOT EXISTS checkpoints (
                 task_id TEXT NOT NULL REFERENCES tasks(id), node TEXT NOT NULL, status TEXT NOT NULL,
@@ -141,6 +154,47 @@ class PostgresTaskStore:
                 (task_id, TaskState.PENDING.value, repository, pull_request,
                  json.dumps(payload), now, now, tenant_id),
             )
+
+    def acquire_task_lease(
+        self, task_id: str, owner: str, lease_seconds: int = 60,
+    ) -> Optional[int]:
+        """Take the execution lease and return a fencing token, or None if held."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET lease_owner=%s, lease_token=lease_token+1, "
+                "lease_expires_at=%s WHERE id=%s AND state NOT IN (%s,%s,%s) "
+                "AND (lease_owner='' OR lease_owner=%s OR lease_expires_at IS NULL "
+                "OR lease_expires_at < %s)",
+                (owner, lease_deadline(lease_seconds), task_id, *TERMINAL_STATES,
+                 owner, utc_now()),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT lease_token FROM tasks WHERE id=%s", (task_id,)
+            ).fetchone()
+            return int(row["lease_token"]) if row else None
+
+    def renew_task_lease(
+        self, task_id: str, owner: str, token: int, lease_seconds: int = 60,
+    ) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET lease_expires_at=%s WHERE id=%s AND lease_owner=%s "
+                "AND lease_token=%s AND state NOT IN (%s,%s,%s)",
+                (lease_deadline(lease_seconds), task_id, owner, int(token),
+                 *TERMINAL_STATES),
+            )
+            return cursor.rowcount == 1
+
+    def release_task_lease(self, task_id: str, owner: str, token: int) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET lease_owner='', lease_expires_at=NULL "
+                "WHERE id=%s AND lease_owner=%s AND lease_token=%s",
+                (task_id, owner, int(token)),
+            )
+            return cursor.rowcount == 1
 
     def transition(self, task_id: str, event: TraceEvent) -> None:
         with self._connect() as conn:
@@ -700,6 +754,49 @@ class PostgresTaskStore:
                 "VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+
+    def create_webhook_task(
+        self, delivery_id: str, task_id: str, repository: str,
+        pull_request: Optional[int], payload: Dict[str, Any],
+        tenant_id: str = "default",
+    ) -> None:
+        """Create the review task and record it against the delivery atomically."""
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
+                "created_at,updated_at,tenant_id,cancel_requested) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,NULL,NULL,%s,%s,%s,FALSE)",
+                (task_id, TaskState.PENDING.value, repository, pull_request,
+                 json.dumps(payload), now, now, tenant_id),
+            )
+            conn.execute(
+                "UPDATE webhook_deliveries SET task_id=%s WHERE delivery_id=%s",
+                (task_id, delivery_id),
+            )
+
+    def list_undispatched_tasks(
+        self, older_than_seconds: int = 60, limit: int = 50,
+    ) -> list:
+        """Pending tasks that were created but never handed to the queue."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(
+            seconds=max(0, int(older_than_seconds))
+        )).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, repository, pull_request, tenant_id, input_json, created_at "
+                "FROM tasks WHERE state=%s AND created_at < %s ORDER BY created_at LIMIT %s",
+                (TaskState.PENDING.value, cutoff, max(1, min(int(limit), 500))),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            payload = dict(item.pop("input_json"))
+            if payload.get("dispatched_at"):
+                continue
+            item["input"] = payload
+            values.append(item)
+        return values
 
     def claim_webhook(
         self, delivery_id: str, tenant_id: str, event_type: str, payload_sha256: str,

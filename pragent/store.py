@@ -3,14 +3,25 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from .models import ReviewReport, TaskState, TraceEvent
 
 
+TERMINAL_STATES = (
+    TaskState.SUCCESS.value, TaskState.FAILED.value, TaskState.CANCELLED.value,
+)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def lease_deadline(lease_seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(
+        seconds=max(1, int(lease_seconds))
+    )).isoformat()
 
 
 class TaskStore:
@@ -150,6 +161,9 @@ class TaskStore:
             )
             self._ensure_column(conn, "tasks", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
             self._ensure_column(conn, "tasks", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "tasks", "lease_owner", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "tasks", "lease_token", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "tasks", "lease_expires_at", "TEXT")
             self._ensure_column(conn, "installations", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS checkpoints (
@@ -331,6 +345,52 @@ class TaskStore:
                 (task_id, TaskState.PENDING.value, repository, pull_request,
                  json.dumps(payload), now, now, tenant_id),
             )
+
+    def acquire_task_lease(
+        self, task_id: str, owner: str, lease_seconds: int = 60,
+    ) -> Optional[int]:
+        """Take the execution lease and return a fencing token, or None if held.
+
+        A single conditional UPDATE keeps the check and the claim atomic across
+        processes; a separate SELECT would race with another worker.
+        """
+        deadline = lease_deadline(lease_seconds)
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET lease_owner=?, lease_token=lease_token+1, lease_expires_at=? "
+                "WHERE id=? AND state NOT IN (?,?,?) "
+                "AND (lease_owner='' OR lease_owner=? OR lease_expires_at IS NULL "
+                "OR lease_expires_at < ?)",
+                (owner, deadline, task_id, *TERMINAL_STATES, owner, now),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT lease_token FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            return int(row["lease_token"]) if row else None
+
+    def renew_task_lease(
+        self, task_id: str, owner: str, token: int, lease_seconds: int = 60,
+    ) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET lease_expires_at=? WHERE id=? AND lease_owner=? "
+                "AND lease_token=? AND state NOT IN (?,?,?)",
+                (lease_deadline(lease_seconds), task_id, owner, int(token),
+                 *TERMINAL_STATES),
+            )
+            return cursor.rowcount == 1
+
+    def release_task_lease(self, task_id: str, owner: str, token: int) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET lease_owner='', lease_expires_at=NULL "
+                "WHERE id=? AND lease_owner=? AND lease_token=?",
+                (task_id, owner, int(token)),
+            )
+            return cursor.rowcount == 1
 
     def transition(self, task_id: str, event: TraceEvent) -> None:
         with self._lock, self._connect() as conn:
@@ -918,6 +978,54 @@ class TaskStore:
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (?,?,?,?,?)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+
+    def create_webhook_task(
+        self, delivery_id: str, task_id: str, repository: str,
+        pull_request: Optional[int], payload: Dict[str, Any],
+        tenant_id: str = "default",
+    ) -> None:
+        """Create the review task and record it against the delivery atomically.
+
+        Splitting these writes leaves two bad outcomes: a webhook marked as
+        handled with no task behind it, or a task that no delivery points at.
+        Both must commit or neither.
+        """
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
+                "created_at,updated_at,tenant_id,cancel_requested) "
+                "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 0)",
+                (task_id, TaskState.PENDING.value, repository, pull_request,
+                 json.dumps(payload), now, now, tenant_id),
+            )
+            conn.execute(
+                "UPDATE webhook_deliveries SET task_id=? WHERE delivery_id=?",
+                (task_id, delivery_id),
+            )
+
+    def list_undispatched_tasks(
+        self, older_than_seconds: int = 60, limit: int = 50,
+    ) -> list:
+        """Pending tasks that were created but never handed to the queue."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(
+            seconds=max(0, int(older_than_seconds))
+        )).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, repository, pull_request, tenant_id, input_json, created_at "
+                "FROM tasks WHERE state=? AND created_at < ? ORDER BY created_at LIMIT ?",
+                (TaskState.PENDING.value, cutoff, max(1, min(int(limit), 500))),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            payload = json.loads(item.pop("input_json"))
+            if payload.get("dispatched_at"):
+                continue
+            item["input"] = payload
+            values.append(item)
+        return values
 
     def claim_webhook(
         self, delivery_id: str, tenant_id: str, event_type: str, payload_sha256: str,

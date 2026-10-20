@@ -26,6 +26,7 @@ from .reviewer import (
 from .skills import AgentSkill, SkillRegistry
 from .skill_evolution import AgentSkillReplayReviewer, SkillEvolutionEngine, validate_artifact
 from .store import utc_now
+from .task_lease import TaskLease
 from .task_queue import PermanentTaskError, TaskQueue
 from .rollout import ReleaseManager
 from .verifier import RepairVerifier
@@ -245,6 +246,7 @@ class ReviewService:
         tenant_id: str = "default", repository_root: str = "",
         enabled_agents: Optional[list] = None,
         enabled_skills: Optional[list] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         task_id = str(uuid.uuid4())
         encoded = diff.encode("utf-8")
@@ -256,22 +258,28 @@ class ReviewService:
             "repository_root": repository_root,
             "enabled_agents": enabled_agents or [],
             "enabled_skills": enabled_skills or [],
+            **(extra or {}),
         }, tenant_id)
         self.store.save_task_payload(task_id, diff)
         return task_id
 
-    def _create_deferred_task(
-        self, repository: str, pull_request: Optional[int], source: str,
+    def _create_webhook_task(
+        self, delivery_id: str, repository: str, pull_request: Optional[int],
         tenant_id: str, payload: Dict[str, Any],
     ) -> str:
+        """Create the task and mark the delivery handled in one transaction."""
         task_id = str(uuid.uuid4())
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
-        self.store.create(task_id, repository, pull_request, {
-            "source": source, "diff_pending": True,
-            "release_lane": assignment["lane"], "shadow": assignment["shadow"],
-            **payload,
-            "mode": RunMode.AGENTIC.value,
-        }, tenant_id)
+        self.store.create_webhook_task(
+            delivery_id, task_id, repository, pull_request,
+            {
+                "source": "github-webhook", "diff_pending": True,
+                "release_lane": assignment["lane"], "shadow": assignment["shadow"],
+                **payload,
+                "mode": RunMode.AGENTIC.value,
+            },
+            tenant_id,
+        )
         return task_id
 
     def create_review(
@@ -335,6 +343,11 @@ class ReviewService:
             "github_issue_url": github_issue_url, "installation_id": installation_id,
             "tenant_id": tenant_id,
         }, message_id=task_id)
+        self.store.update_task_input(task_id, {
+            "dispatched_at": utc_now(),
+            "github_issue_url": github_issue_url,
+            "installation_id": installation_id,
+        })
         metrics.inc("reviews_enqueued_total")
         return {"task_id": task_id, "state": "PENDING", "queue": self.queue.backend}
 
@@ -343,7 +356,28 @@ class ReviewService:
         task = self.store.get(task_id)
         if not task:
             raise PermanentTaskError("task record no longer exists")
+        if task.get("state") == TaskState.SUCCESS.value:
+            # The same delivery can arrive twice; a finished task is not re-run.
+            metrics.inc("review_queue_duplicate_total")
+            return
         tenant_id = payload.get("tenant_id") or task.get("tenant_id") or "default"
+        lease = TaskLease(self.store, task_id, self.settings.queue_lease_seconds)
+        if not lease.acquire():
+            # Another worker owns this task right now; dropping the duplicate is
+            # correct because that worker is responsible for the outcome.
+            metrics.inc("review_queue_contended_total")
+            return
+        try:
+            self._process_leased(payload, task, tenant_id, task_id)
+        finally:
+            if lease.lost:
+                metrics.inc("review_lease_lost_total")
+            lease.release()
+
+    def _process_leased(
+        self, payload: Dict[str, Any], task: Dict[str, Any],
+        tenant_id: str, task_id: str,
+    ) -> None:
         diff = self.store.get_task_payload(task_id)
         if diff is None and payload.get("diff_url"):
             client = (
@@ -400,6 +434,40 @@ class ReviewService:
             return "<!-- pragent-review:%s -->" % task_id
         return "<!-- pragent-review:%s#%s -->" % (repository, pull_request)
 
+    def _queue_payload_for_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        value = task.get("input") or {}
+        payload = {
+            "task_id": task["id"], "repository": task["repository"],
+            "pull_request": task.get("pull_request"),
+            "github_issue_url": value.get("github_issue_url", ""),
+            "installation_id": value.get("installation_id"),
+            "tenant_id": task.get("tenant_id") or "default",
+        }
+        if value.get("diff_url"):
+            payload["diff_url"] = value["diff_url"]
+        return payload
+
+    def _redispatch_task(self, task: Dict[str, Any]) -> bool:
+        """Hand a task to the queue unless it was already dispatched."""
+        if (task.get("input") or {}).get("dispatched_at"):
+            return False
+        task_id = task["id"]
+        self.queue.submit(self._queue_payload_for_task(task), message_id=task_id)
+        self.store.update_task_input(task_id, {"dispatched_at": utc_now()})
+        metrics.inc("tasks_dispatched_total")
+        return True
+
+    def redispatch_pending(
+        self, older_than_seconds: int = 60, limit: int = 50,
+    ) -> dict:
+        """Re-queue tasks that were created but never reached the queue."""
+        submitted = []
+        for item in self.store.list_undispatched_tasks(older_than_seconds, limit):
+            task = self.store.get(item["id"])
+            if task and self._redispatch_task(task):
+                submitted.append(item["id"])
+        return {"redispatched": submitted}
+
     def _on_dead_letter(self, payload: Dict[str, Any], error: str) -> None:
         task_id = payload.get("task_id", "")
         tenant_id = payload.get("tenant_id", "default")
@@ -435,10 +503,17 @@ class ReviewService:
             delivery_id, tenant_id, "pull_request", payload_sha256
         ):
             existing = self.store.get_webhook(delivery_id) or {}
-            return {
-                "duplicate": True, "task_id": existing.get("task_id"),
-                "state": "PENDING" if existing.get("task_id") else "ACCEPTED",
-            }
+            task_id = existing.get("task_id")
+            if task_id:
+                task = self.store.get(task_id)
+                if task and task.get("state") == TaskState.PENDING.value:
+                    # The first attempt may have stopped between creating the
+                    # task and handing it to the queue; finish that dispatch.
+                    self._redispatch_task(task)
+                return {"duplicate": True, "task_id": task_id, "state": "PENDING"}
+            # No task was ever recorded for this delivery, so this retry is the
+            # first successful attempt rather than a duplicate.
+            metrics.inc("webhook_redispatch_total")
         action = payload.get("action")
         if action not in {"opened", "reopened", "synchronize"}:
             self.store.complete_webhook(delivery_id, None)
@@ -451,9 +526,12 @@ class ReviewService:
         if not repository or not isinstance(number, int) or not diff_url:
             raise ValueError("invalid GitHub pull_request payload")
         self._authorize_repository(tenant_id, repository)
-        task_id = self._create_deferred_task(
-            repository, number, "github-webhook", tenant_id,
-            {"diff_url": diff_url},
+        task_id = self._create_webhook_task(
+            delivery_id, repository, number, tenant_id, {
+                "diff_url": diff_url,
+                "github_issue_url": pull.get("issue_url", ""),
+                "installation_id": installation_id,
+            },
         )
         self.queue.submit({
             "task_id": task_id, "repository": repository, "pull_request": number,
@@ -461,9 +539,9 @@ class ReviewService:
             "installation_id": installation_id, "tenant_id": tenant_id,
             "diff_url": diff_url,
         }, message_id=task_id)
+        self.store.update_task_input(task_id, {"dispatched_at": utc_now()})
         metrics.inc("reviews_enqueued_total")
         result = {"task_id": task_id, "state": "PENDING", "queue": self.queue.backend}
-        self.store.complete_webhook(delivery_id, result["task_id"])
         result["will_post_to_github"] = self.settings.auto_post_review
         return result
 
@@ -524,11 +602,8 @@ class ReviewService:
         diff = self.store.get_task_payload(task_id)
         if diff is None:
             raise ValueError("task payload is no longer available")
-        self.queue.submit({
-            "task_id": task_id, "repository": task["repository"],
-            "pull_request": task.get("pull_request"),
-            "tenant_id": task.get("tenant_id", "default"),
-        }, message_id=task_id)
+        self.queue.submit(self._queue_payload_for_task(task), message_id=task_id)
+        self.store.update_task_input(task_id, {"dispatched_at": utc_now()})
         return {"task_id": task_id, "state": "PENDING", "resumed": True}
 
     def cancel_task(self, task_id: str, tenant_id: Optional[str] = None) -> bool:

@@ -67,8 +67,37 @@ class TaskQueue:
             self._executor.submit(self._deliver, envelope)
         return envelope["message_id"]
 
-    def _deliver(self, envelope: Dict[str, Any]) -> bool:
+    def _start_claim_heartbeat(self, redis_id: str) -> Optional[threading.Event]:
+        """Keep the pending entry's idle time low while the handler is running.
+
+        Without this, a review that takes longer than the lease looks abandoned
+        and another consumer claims it, running the same task twice.
+        """
+        if not self._redis or not redis_id:
+            return None
+        stop = threading.Event()
+        interval = max(0.2, self.lease_seconds / 3.0)
+
+        def beat() -> None:
+            while not stop.wait(interval):
+                try:
+                    self._redis.xclaim(
+                        self.STREAM, self.GROUP, self.consumer, 0, [redis_id], idle=0,
+                    )
+                except Exception:
+                    # Losing the heartbeat must not kill the work in progress;
+                    # the database lease still protects the task.
+                    return
+
+        thread = threading.Thread(
+            target=beat, name="pragent-pel-lease", daemon=True,
+        )
+        thread.start()
+        return stop
+
+    def _deliver(self, envelope: Dict[str, Any], redis_id: str = "") -> bool:
         envelope["attempt"] = int(envelope.get("attempt", 0)) + 1
+        heartbeat = self._start_claim_heartbeat(redis_id)
         try:
             self.handler(envelope["payload"])
             return True
@@ -88,6 +117,9 @@ class TaskQueue:
                 timer.daemon = True
                 timer.start()
             return False
+        finally:
+            if heartbeat is not None:
+                heartbeat.set()
 
     def _submit_memory(self, envelope: Dict[str, Any]) -> None:
         if not self._stop.is_set():
@@ -112,7 +144,7 @@ class TaskQueue:
                         self._redis.xack(self.STREAM, self.GROUP, redis_id)
                         continue
                     try:
-                        self._deliver(envelope)
+                        self._deliver(envelope, redis_id)
                         # ACK only after work completed or was safely requeued/DLQed.
                         self._redis.xack(self.STREAM, self.GROUP, redis_id)
                     except Exception:
@@ -125,14 +157,29 @@ class TaskQueue:
                 self.STREAM, self.GROUP, self.consumer,
                 min_idle_time=self.lease_seconds * 1000, start_id="0-0", count=10,
             )
-            entries = result[1] if len(result) > 1 else []
-            for redis_id, fields in entries:
-                envelope = json.loads(fields["envelope"])
-                self._deliver(envelope)
-                self._redis.xack(self.STREAM, self.GROUP, redis_id)
         except Exception:
             # Redis versions without XAUTOCLAIM still process new entries.
             return
+        entries = result[1] if len(result) > 1 else []
+        for redis_id, fields in entries:
+            if not fields:
+                continue
+            try:
+                envelope = json.loads(fields["envelope"])
+            except Exception as exc:
+                # An unparseable entry would stay pending forever; park it.
+                self._dead_letter({
+                    "message_id": redis_id, "attempt": self.max_attempts,
+                    "payload": {}, "submitted_at": time.time(),
+                }, "invalid queue envelope: %s" % exc)
+                self._redis.xack(self.STREAM, self.GROUP, redis_id)
+                continue
+            try:
+                self._deliver(envelope, redis_id)
+                self._redis.xack(self.STREAM, self.GROUP, redis_id)
+            except Exception:
+                # Infrastructure failure: leave it pending for the next reclaim.
+                continue
 
     def _dead_letter(self, envelope: Dict[str, Any], error: str) -> None:
         item = {**envelope, "error": error[:2000], "failed_at": time.time()}
