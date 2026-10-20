@@ -48,16 +48,35 @@ class GitHubClient:
         with urllib.request.urlopen(request, timeout=self.timeout):
             return None
 
-    def upsert_comment(self, api_url: str, markdown: str, marker: str) -> None:
-        """Update this service's existing review comment instead of creating duplicates."""
+    COMMENT_PAGE_SIZE = 100
+    COMMENT_MAX_PAGES = 5
+
+    def upsert_comment(self, api_url: str, markdown: str, marker: str) -> str:
+        """Publish or refresh this service's comment for one issue, keyed by marker.
+
+        Returns "updated" when an existing comment carrying the marker was refreshed
+        and "created" when a new comment had to be posted.
+        """
         comments_url = api_url.rstrip("/") + "/comments"
-        comments = self._json("GET", comments_url + "?per_page=100")
         body = marker + "\n" + markdown
-        for comment in comments:
-            if marker in str(comment.get("body", "")):
-                self._json("PATCH", comment["url"], {"body": body})
-                return
+        for page in range(1, self.COMMENT_MAX_PAGES + 1):
+            comments = self._json(
+                "GET",
+                "%s?per_page=%d&page=%d" % (comments_url, self.COMMENT_PAGE_SIZE, page),
+            )
+            if not isinstance(comments, list) or not comments:
+                break
+            for comment in comments:
+                if marker not in str(comment.get("body", "")):
+                    continue
+                try:
+                    self._json("PATCH", comment["url"], {"body": body})
+                    return "updated"
+                except RuntimeError:
+                    # A foreign comment may quote our marker; keep searching, then post.
+                    continue
         self._json("POST", comments_url, {"body": body})
+        return "created"
 
     def _json(self, method: str, url: str, payload=None):
         return self._request(method, url, payload)

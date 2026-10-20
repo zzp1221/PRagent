@@ -1,5 +1,7 @@
 import json
 
+from pragent.github import GitHubClient
+
 
 class FakeAgenticClient:
     provider = "fake"
@@ -82,6 +84,38 @@ class FakeAgenticClient:
                 ],
             }
         raise AssertionError(role)
+
+
+class FakeGitHubComments(GitHubClient):
+    """In-memory stand-in for the GitHub issue-comment API."""
+
+    def __init__(self):
+        super().__init__("fake-token")
+        self.comments = []
+        self.readonly_urls = set()
+        self.calls = []
+
+    def _json(self, method, url, payload=None):
+        self.calls.append((method, url))
+        if method == "GET":
+            page = int(url.rsplit("page=", 1)[1])
+            start = (page - 1) * self.COMMENT_PAGE_SIZE
+            return [dict(item) for item in self.comments[start:start + self.COMMENT_PAGE_SIZE]]
+        if method == "PATCH":
+            if url in self.readonly_urls:
+                raise RuntimeError("GitHub API PATCH returned HTTP 403")
+            for item in self.comments:
+                if item["url"] == url:
+                    item["body"] = payload["body"]
+                    return {}
+            raise AssertionError("patch target missing: %s" % url)
+        if method == "POST":
+            self.comments.append({
+                "url": "https://api.github.com/comments/%d" % (len(self.comments) + 1),
+                "body": payload["body"],
+            })
+            return {}
+        raise AssertionError(method)
 
 
 def enable_agentic_service(service):

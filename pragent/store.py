@@ -2,6 +2,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -18,10 +19,18 @@ class TaskStore:
         self._lock = threading.Lock()
         self._init()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
+        # sqlite3's connection context manager only commits or rolls back; the
+        # handle itself must be closed or the file stays locked on Windows and
+        # every store call leaks a descriptor.
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init(self) -> None:
         with self._connect() as conn:

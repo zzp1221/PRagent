@@ -4,7 +4,7 @@ import unittest
 
 from pragent.config import Settings
 from pragent.service import ReviewService
-from agentic_fake import enable_agentic_service
+from agentic_fake import FakeGitHubComments, enable_agentic_service
 
 
 class ServiceTests(unittest.TestCase):
@@ -67,6 +67,37 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("false_positive", cases[0]["category"])
         self.assertEqual("SEC-EVAL", cases[0]["payload"]["finding"]["rule_id"])
         service.queue.close()
+
+    def test_same_pull_request_reuses_one_review_comment(self):
+        diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
+        settings = Settings(
+            host="127.0.0.1", port=8080, db_path=self.path, max_diff_bytes=10000,
+            max_steps=8, timeout_seconds=10, llm_base_url="", llm_api_key="", llm_model="",
+            github_webhook_secret="", github_token="", auto_post_review=True,
+        )
+        service = enable_agentic_service(ReviewService(settings))
+        client = FakeGitHubComments()
+        service.github_client_for_installation = lambda installation_id=None: client
+
+        payloads = []
+        for _ in range(2):
+            task_id = service._create_task("org/repo", diff, 7, "github-webhook")
+            payloads.append({
+                "task_id": task_id, "repository": "org/repo", "pull_request": 7,
+                "github_issue_url": "https://api.github.com/repos/org/repo/issues/7",
+                "tenant_id": "default",
+            })
+        service._process_queued(payloads[0])
+        service._process_queued(payloads[1])
+        service.queue.close()
+
+        self.assertEqual(1, len(client.comments))
+        body = client.comments[0]["body"]
+        self.assertIn("<!-- pragent-review:org/repo#7 -->", body)
+        self.assertIn(
+            "<!-- pragent-review-task:%s -->" % payloads[1]["task_id"], body
+        )
+        self.assertNotIn(payloads[0]["task_id"], body)
 
 
 if __name__ == "__main__":

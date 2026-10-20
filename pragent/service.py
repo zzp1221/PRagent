@@ -374,16 +374,31 @@ class ReviewService:
             self.releases.observe(tenant_id, "llm-review", False, lane)
             if payload.get("github_issue_url") and self.settings.auto_post_review:
                 client = self.github_client_for_installation(payload.get("installation_id"))
-                client.upsert_comment(
-                    payload["github_issue_url"], to_markdown(report.to_dict()),
-                    "<!-- pragent-review:%s -->" % task_id,
+                action = client.upsert_comment(
+                    payload["github_issue_url"],
+                    "<!-- pragent-review-task:%s -->\n%s" % (
+                        task_id, to_markdown(report.to_dict()),
+                    ),
+                    self._review_comment_marker(
+                        payload["repository"], payload.get("pull_request"), task_id,
+                    ),
                 )
+                metrics.inc("github_comments_%s" % action)
         except Exception:
             metrics.inc("reviews_failed_total")
             lane = (task.get("input") or {}).get("release_lane", "stable")
             self.releases.observe(tenant_id, "llm-review", True, lane)
             self.alerts.evaluate(tenant_id)
             raise
+
+    @staticmethod
+    def _review_comment_marker(
+        repository: str, pull_request: Optional[int], task_id: str,
+    ) -> str:
+        """Marker that identifies one PR's review comment across repeated tasks."""
+        if pull_request is None:
+            return "<!-- pragent-review:%s -->" % task_id
+        return "<!-- pragent-review:%s#%s -->" % (repository, pull_request)
 
     def _on_dead_letter(self, payload: Dict[str, Any], error: str) -> None:
         task_id = payload.get("task_id", "")
