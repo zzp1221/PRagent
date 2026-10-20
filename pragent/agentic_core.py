@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .diff_parser import ParsedDiff
 from .context_manager import ContextManager
+from .budget import ReviewBudget
 from .gates import FindingGate
 from .finding_identity import canonical_identity
 from .llm import JsonChatClient
@@ -137,7 +138,7 @@ class BoundedRole:
         token_budget: int, time_budget: int, max_steps: int = 4,
         context_manager: Optional[ContextManager] = None,
         working_memory_supplier=None, observation_sink=None,
-        max_output_tokens: int = 4000,
+        max_output_tokens: int = 4000, budget=None,
     ):
         self.name = name
         self.prompt = prompt
@@ -145,10 +146,16 @@ class BoundedRole:
         self.token_budget = token_budget
         self.time_budget = time_budget
         self.max_steps = max_steps
+        # Review-wide ceiling; per-role budgets cannot bound the whole review.
+        self.budget = budget
         self.context_manager = context_manager or ContextManager()
         self.working_memory_supplier = working_memory_supplier
         self.observation_sink = observation_sink
         self.max_output_tokens = max(128, int(max_output_tokens))
+
+    def _check_review_budget(self) -> None:
+        if self.budget is not None:
+            self.budget.check(self.name)
 
     def run(
         self, user_context: str, tools: ToolRegistry, ledger: ExecutionLedger,
@@ -164,6 +171,7 @@ class BoundedRole:
             time_budget_seconds=self.time_budget, tools=tools.names(),
         )
         for step in range(1, self.max_steps + 1):
+            self._check_review_budget()
             elapsed = time.monotonic() - started
             used = sum(
                 item.input_tokens + item.output_tokens
@@ -214,6 +222,9 @@ class BoundedRole:
             reopened = 0
             while kind not in {"final", "tool"} and reopened < 2:
                 reopened += 1
+                # A malformed reply costs a full model call, so the shared
+                # ceiling has to be rechecked inside the retry loop too.
+                self._check_review_budget()
                 ledger.trace(
                     self.name, "invalid_action", step=step, action=kind,
                     raw=json.dumps(action, ensure_ascii=False, default=str)[:500],
@@ -317,6 +328,9 @@ class AgenticReviewer(Reviewer):
         context_manager: Optional[ContextManager] = None,
         skill_provider=None,
         max_output_tokens: int = 4000,
+        review_token_budget: int = 0,
+        review_time_budget_seconds: int = 0,
+        review_max_model_calls: int = 0,
     ):
         self.store = store
         self.client = llm_client
@@ -342,9 +356,34 @@ class AgenticReviewer(Reviewer):
                 self.structured_config, ensure_ascii=False, sort_keys=True
             )
         self.gate = FindingGate()
+        self.review_token_budget = max(0, int(review_token_budget or 0))
+        self.review_time_budget_seconds = max(0, int(review_time_budget_seconds or 0))
+        self.review_max_model_calls = max(0, int(review_max_model_calls or 0))
+        self._review_budgets: Dict[str, ReviewBudget] = {}
+        self._review_budget_lock = threading.Lock()
         self._summaries: Dict[str, dict] = {}
         self._memory_scopes: Dict[str, tuple] = {}
         self._memory_scope_lock = threading.Lock()
+
+    @staticmethod
+    def _initial_worker_steps(high_risk: bool, tools_available: bool) -> int:
+        """High risk gets a full loop; a normal review gets one lookup, if any."""
+        if high_risk:
+            return 3
+        return 2 if tools_available else 1
+
+    @staticmethod
+    def _needs_evidence_support(candidates) -> bool:
+        """True when a high-risk candidate asserts a defect it cannot evidence."""
+        return any(
+            item.severity in {Severity.CRITICAL, Severity.HIGH}
+            and not item.evidence_refs and not item.call_chain
+            for item in candidates
+        )
+
+    def _budget_for(self, task_id: str) -> Optional[ReviewBudget]:
+        with self._review_budget_lock:
+            return self._review_budgets.get(task_id)
 
     def _token_budget(self, role: str) -> int:
         raw = (self.structured_config.get("budget_parameters") or {}).get(
@@ -377,6 +416,8 @@ class AgenticReviewer(Reviewer):
             # retain their TTL so a resumed task can still use them.
             with self._memory_scope_lock:
                 self._memory_scopes.pop(task_id, None)
+            with self._review_budget_lock:
+                self._review_budgets.pop(task_id, None)
 
     def _review_with_context(
         self, task_id: str, diff: str, parsed: ParsedDiff,
@@ -392,6 +433,12 @@ class AgenticReviewer(Reviewer):
             resolution.effective.value, self.input_cost_per_million,
             self.output_cost_per_million,
         )
+        budget = ReviewBudget(
+            ledger, self.review_token_budget, self.review_time_budget_seconds,
+            self.review_max_model_calls,
+        )
+        with self._review_budget_lock:
+            self._review_budgets[task_id] = budget
         root = str(task_input.get("repository_root") or "")
         if not root and os.path.isdir(repository):
             root = repository
@@ -440,6 +487,9 @@ class AgenticReviewer(Reviewer):
         execution = ledger.summary()
         context_management = self.context_manager.summary(task_id)
         execution["context_management"] = context_management
+        budget = self._budget_for(task_id)
+        if budget is not None:
+            execution["review_budget"] = budget.snapshot()
         summary = {
             "run_mode": resolution.to_dict(),
             "components": components + [
@@ -603,8 +653,10 @@ class AgenticReviewer(Reviewer):
             session["delegations"], revision_round=0,
             memory_context=memory_context,
             available_skills=available_skills,
-            max_steps=3 if high_risk else 1,
-            allow_tools=high_risk,
+            max_steps=self._initial_worker_steps(
+                high_risk, suite.repository_available,
+            ),
+            allow_tools=high_risk or suite.repository_available,
         )
         session["phase"] = "workers-completed"
         self._save_lead_session(task_id, session, ledger)
@@ -677,11 +729,17 @@ class AgenticReviewer(Reviewer):
         candidates = self._session_candidates(session)
         session["candidate_findings_before_critic"] = len(candidates)
         if "critic" in enabled and not session.get("critic_complete"):
+            # Give the critic a tool only when a candidate claims a high-risk
+            # defect it cannot evidence and a repository is actually available.
+            critic_tools = suite.repository_available and (
+                high_risk or self._needs_evidence_support(candidates)
+            )
             critic_result = self._run_critic(
                 diff, candidates,
                 str(final_assessment.get("critic_objective", "")),
                 suite, ledger, task_id, memory_context,
-                max_steps=1, allow_tools=False,
+                max_steps=2 if critic_tools else 1,
+                allow_tools=critic_tools,
             )
             candidates, decisions = self._apply_critic(critic_result, candidates)
             session["critic_decisions"] = decisions
@@ -871,6 +929,7 @@ class AgenticReviewer(Reviewer):
             working_memory_supplier=working_memory_supplier,
             observation_sink=observation_sink,
             max_output_tokens=self.max_output_tokens,
+            budget=self._budget_for(context_key),
         )
         context = {"phase": phase, **payload}
         if not allow_tools:
@@ -916,6 +975,7 @@ class AgenticReviewer(Reviewer):
             working_memory_supplier=working_memory_supplier,
             observation_sink=observation_sink,
             max_output_tokens=self.max_output_tokens,
+            budget=self._budget_for(context_key),
         )
         return role.run(
             json.dumps({
@@ -951,6 +1011,7 @@ class AgenticReviewer(Reviewer):
         ]
         if not pending:
             return
+        budget = self._budget_for(task_id)
 
         def run(assignment):
             worker = assignment["worker"]
@@ -979,6 +1040,7 @@ class AgenticReviewer(Reviewer):
                 working_memory_supplier=working_memory_supplier,
                 observation_sink=observation_sink,
                 max_output_tokens=self.max_output_tokens,
+                budget=budget,
             )
             context = {
                 "lead_assignment": assignment,
@@ -996,7 +1058,11 @@ class AgenticReviewer(Reviewer):
                     (
                         "This is a one-shot review with no tools. Return final findings now; "
                         "do not request a tool. "
-                    ) if not allow_tools else ""
+                    ) if not allow_tools else (
+                        "" if max_steps >= 3 else
+                        "You may run at most one repository lookup when a fact you need is "
+                        "genuinely missing, then report. "
+                    )
                 ) + (
                     "Report only to the Lead. Return final findings with exact changed-line "
                     "evidence and address every required_evidence item."

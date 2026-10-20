@@ -182,6 +182,7 @@ class ReviewService:
             self.context_manager,
             self._active_agent_skills,
             self.settings.agent_max_output_tokens,
+            **self.settings.resolved_review_budget(),
         )
 
     def _run_review(

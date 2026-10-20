@@ -135,7 +135,13 @@ python -m pragent
 $env:PRAGENT_LLM_REASONING_EFFORT = 'low'        # disabled 之外的最低思考强度
 $env:PRAGENT_AGENT_MAX_OUTPUT_TOKENS = '8000'    # 单次调用输出上限
 $env:PRAGENT_AGENT_TOKEN_BUDGET = '24000'        # 每个 Agent 角色的累计预算
+$env:PRAGENT_AGENT_REVIEW_TOKEN_BUDGET = '120000' # 整次审查（所有角色+返工）的上限
 ```
+
+角色级预算约束不了整次审查：Lead 有多个阶段，Worker 可能返工，Critic 还要再调用一次。
+`PRAGENT_AGENT_REVIEW_TOKEN_BUDGET`、`PRAGENT_AGENT_REVIEW_TIME_BUDGET_SECONDS`、
+`PRAGENT_AGENT_REVIEW_MAX_MODEL_CALLS` 是整次审查共享的硬上限，耗尽即中止并把原因写进任务错误与
+`execution.review_budget`。留 0 时按角色预算推导（tokens ×6、秒数 ×4），调用次数不限。
 
 需要完全关闭思考（结构化 JSON 任务通常足够）时设 `PRAGENT_LLM_THINKING=disabled`。这两个参数默认不发送，非 DeepSeek 的 OpenAI 兼容端点不受影响。
 

@@ -135,6 +135,23 @@ class Settings:
     llm_thinking: str = ""
     llm_reasoning_effort: str = ""
     agent_max_output_tokens: int = 4000
+    # Ceilings for one whole review across every role, retry and rework round.
+    # Zero means "derive from the per-role budget".
+    agent_review_token_budget: int = 0
+    agent_review_time_budget_seconds: int = 0
+    agent_review_max_model_calls: int = 0
+
+    def resolved_review_budget(self) -> Dict[str, int]:
+        """Derive the review-wide ceiling when it is not set explicitly."""
+        return {
+            "review_token_budget": (
+                self.agent_review_token_budget or self.agent_token_budget * 6
+            ),
+            "review_time_budget_seconds": (
+                self.agent_review_time_budget_seconds or self.agent_time_budget_seconds * 4
+            ),
+            "review_max_model_calls": self.agent_review_max_model_calls,
+        }
 
     def resolved_llm(self) -> Dict[str, object]:
         """Resolve a named provider to the existing OpenAI-compatible transport."""
@@ -332,4 +349,13 @@ class Settings:
             llm_thinking=os.getenv("PRAGENT_LLM_THINKING", "").strip(),
             llm_reasoning_effort=os.getenv("PRAGENT_LLM_REASONING_EFFORT", "").strip(),
             agent_max_output_tokens=_int("PRAGENT_AGENT_MAX_OUTPUT_TOKENS", 4000),
+            agent_review_token_budget=_non_negative_int(
+                "PRAGENT_AGENT_REVIEW_TOKEN_BUDGET", 0
+            ),
+            agent_review_time_budget_seconds=_non_negative_int(
+                "PRAGENT_AGENT_REVIEW_TIME_BUDGET_SECONDS", 0
+            ),
+            agent_review_max_model_calls=_non_negative_int(
+                "PRAGENT_AGENT_REVIEW_MAX_MODEL_CALLS", 0
+            ),
         )
