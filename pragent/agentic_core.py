@@ -431,7 +431,7 @@ class AgenticReviewer(Reviewer):
             task_id, diff, parsed, suite, ledger, enabled, scanners, memory_context,
             available_skills, requested_skills,
         )
-        gated = self.gate.apply(findings, parsed)
+        gated = self.gate.apply(findings, parsed, ledger)
         ledger.trace("evidence-gate", "completed", **gated.checks)
         self._persist_task_memory(
             task_id, tenant_id, repository, findings, gated,
@@ -1344,10 +1344,12 @@ class AgenticReviewer(Reviewer):
             scans += 1
             if supported:
                 rendered = json.dumps(payload, sort_keys=True)
+                evidence_id = "diff-ast:%s" % hashlib.sha256(
+                    rendered.encode("utf-8")
+                ).hexdigest()[:16]
+                ledger.record_evidence(evidence_id, "diff-ast-analyze")
                 finding.evidence_refs.append({
-                    "evidence_id": "diff-ast:%s" % hashlib.sha256(
-                        rendered.encode("utf-8")
-                    ).hexdigest()[:16],
+                    "evidence_id": evidence_id,
                     "tool": "diff-ast-analyze", **payload,
                 })
         return scans

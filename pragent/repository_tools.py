@@ -54,6 +54,14 @@ class RepositoryToolSuite:
     def repository_available(self) -> bool:
         return bool(self.root)
 
+    def _remember_evidence(self, tool: str, value: Any) -> None:
+        """Record the evidence id a tool produced so the gate can verify citations."""
+        if self.ledger is None or not isinstance(value, dict):
+            return
+        evidence_id = value.get("evidence_id")
+        if evidence_id:
+            self.ledger.record_evidence(str(evidence_id), tool)
+
     def _safe_path(self, relative: str) -> str:
         if not self.root:
             raise ValueError("repository checkout is unavailable for this review")
@@ -419,6 +427,7 @@ class RepositoryToolSuite:
                             role, _name, arguments, True,
                             int((time.monotonic() - started) * 1000), value,
                         )
+                        self._remember_evidence(_name, value)
                     return value
                 except Exception as exc:
                     if self.ledger:

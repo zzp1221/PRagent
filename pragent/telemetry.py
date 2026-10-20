@@ -41,6 +41,9 @@ class ExecutionLedger:
         self.model_calls: List[ModelCall] = []
         self.tool_calls: List[ToolCall] = []
         self.agent_traces: Dict[str, List[Dict[str, Any]]] = {}
+        # evidence_id -> producing tool, so a finding cannot cite an observation
+        # that this review never made.
+        self.evidence: Dict[str, str] = {}
         self._lock = threading.Lock()
 
     def estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
@@ -80,6 +83,17 @@ class ExecutionLedger:
         with self._lock:
             self.tool_calls.append(call)
 
+    def record_evidence(self, evidence_id: str, tool: str) -> None:
+        with self._lock:
+            self.evidence[str(evidence_id)] = str(tool)
+
+    def has_evidence(self, evidence_id: str, tool: str = "") -> bool:
+        with self._lock:
+            owner = self.evidence.get(str(evidence_id))
+        if not owner:
+            return False
+        return not tool or owner == str(tool)
+
     def trace(self, role: str, event: str, **detail) -> None:
         item = {
             "sequence": 0, "event": event,
@@ -105,16 +119,22 @@ class ExecutionLedger:
             for role, values in (summary.get("agent_traces") or {}).items()
             if isinstance(values, list)
         }
+        evidence = {
+            str(key): str(value)
+            for key, value in (summary.get("evidence") or {}).items()
+        }
         with self._lock:
             self.model_calls = models
             self.tool_calls = tools
             self.agent_traces = traces
+            self.evidence = evidence
 
     def summary(self, include_trace: bool = True) -> Dict[str, Any]:
         with self._lock:
             models = [asdict(item) for item in self.model_calls]
             tools = [asdict(item) for item in self.tool_calls]
             traces = {key: list(value) for key, value in self.agent_traces.items()}
+            evidence = dict(self.evidence)
         return {
             "mode": self.mode,
             "llm_calls": len(models),
@@ -130,5 +150,6 @@ class ExecutionLedger:
             "failed_tool_calls": sum(not item["ok"] for item in tools),
             "model_call_log": models,
             "tool_call_log": tools,
+            "evidence": evidence,
             "agent_traces": traces if include_trace else {},
         }
