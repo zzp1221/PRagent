@@ -2,6 +2,9 @@
 # containers behave identically on Windows and Linux checkouts.
 * text=auto eol=lf
 
+# Batch files must keep CRLF so cmd.exe parses labels correctly.
+*.bat text eol=crlf
+
 *.png binary
 *.jpg binary
 *.jpeg binary

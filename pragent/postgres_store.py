@@ -8,7 +8,7 @@ import hashlib
 import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import ReviewReport, TaskState, TraceEvent
 from .store import TERMINAL_STATES, fence_clause, lease_deadline, utc_now
@@ -135,6 +135,20 @@ class PostgresTaskStore:
                 created_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ)""",
             """CREATE INDEX IF NOT EXISTS idx_agent_memories_lookup
                 ON agent_memories(tenant_id,repository,scope,created_at)""",
+            """CREATE TABLE IF NOT EXISTS runtime_settings (
+                tenant_id TEXT NOT NULL, setting_key TEXT NOT NULL,
+                setting_value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(tenant_id,setting_key))""",
+            """CREATE TABLE IF NOT EXISTS repository_watches (
+                tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'poll', enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                last_sha TEXT NOT NULL DEFAULT '', last_checked_at TIMESTAMPTZ,
+                last_task_id TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(tenant_id,repository))""",
+            """CREATE TABLE IF NOT EXISTS review_commits (
+                tenant_id TEXT NOT NULL, repository TEXT NOT NULL, head_sha TEXT NOT NULL,
+                task_id TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(tenant_id,repository,head_sha))""",
         ]
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -905,6 +919,141 @@ class PostgresTaskStore:
                 (tenant_id, repository),
             ).fetchone()
         return True if total == 0 else bool(row and (not require_auto_fix or row["auto_fix"]))
+
+    # --- Runtime settings (survive restarts; override environment variables) ---
+
+    def get_runtime_setting(self, tenant_id: str, key: str) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT setting_value FROM runtime_settings WHERE tenant_id=%s AND setting_key=%s",
+                (tenant_id, key),
+            ).fetchone()
+        return row["setting_value"] if row else None
+
+    def set_runtime_setting(self, tenant_id: str, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO runtime_settings(tenant_id,setting_key,setting_value,updated_at) "
+                "VALUES (%s,%s,%s,%s) ON CONFLICT(tenant_id,setting_key) DO UPDATE SET "
+                "setting_value=EXCLUDED.setting_value, updated_at=EXCLUDED.updated_at",
+                (tenant_id, key, value, utc_now()),
+            )
+
+    def list_runtime_settings(self, tenant_id: str) -> Dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT setting_key, setting_value FROM runtime_settings WHERE tenant_id=%s",
+                (tenant_id,),
+            ).fetchall()
+        return {row["setting_key"]: row["setting_value"] for row in rows}
+
+    def delete_runtime_setting(self, tenant_id: str, key: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM runtime_settings WHERE tenant_id=%s AND setting_key=%s",
+                (tenant_id, key),
+            )
+
+    # --- Repository watches (polling subscriptions) ---
+
+    def upsert_watch(
+        self, tenant_id: str, repository: str, mode: str = "poll",
+        enabled: bool = True,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO repository_watches"
+                "(tenant_id,repository,mode,enabled,created_at) VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT(tenant_id,repository) DO UPDATE SET "
+                "mode=EXCLUDED.mode, enabled=EXCLUDED.enabled",
+                (tenant_id, repository, mode, bool(enabled), utc_now()),
+            )
+
+    def list_watches(self, tenant_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM repository_watches WHERE tenant_id=%s ORDER BY repository",
+                (tenant_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_watch_check(
+        self, tenant_id: str, repository: str, last_sha: str = "",
+        last_task_id: str = "", error: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE repository_watches SET last_sha=%s, last_task_id=%s, last_error=%s, "
+                "last_checked_at=%s WHERE tenant_id=%s AND repository=%s",
+                (last_sha, last_task_id, error, utc_now(), tenant_id, repository),
+            )
+
+    def delete_watch(self, tenant_id: str, repository: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM repository_watches WHERE tenant_id=%s AND repository=%s",
+                (tenant_id, repository),
+            )
+
+    # --- Review dedup ledger (shared by polling and webhook paths) ---
+
+    def claim_review_commit(
+        self, tenant_id: str, repository: str, head_sha: str, task_id: str,
+    ) -> bool:
+        """Return True only for the first claim of this repository commit."""
+        if not head_sha:
+            return True
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO review_commits"
+                "(tenant_id,repository,head_sha,task_id,created_at) VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT(tenant_id,repository,head_sha) DO NOTHING",
+                (tenant_id, repository, head_sha, task_id, utc_now()),
+            )
+            return bool(cursor.rowcount)
+
+    def find_review_commit(
+        self, tenant_id: str, repository: str, head_sha: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not head_sha:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM review_commits WHERE tenant_id=%s AND repository=%s "
+                "AND head_sha=%s",
+                (tenant_id, repository, head_sha),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def release_review_commit(self, tenant_id: str, repository: str, head_sha: str) -> None:
+        """Drop a claim whose task creation failed, so the commit is retried."""
+        if not head_sha:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM review_commits WHERE tenant_id=%s AND repository=%s AND head_sha=%s",
+                (tenant_id, repository, head_sha),
+            )
+
+    def list_all_watches(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """Every enabled watch across tenants, for the background poller."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM repository_watches WHERE enabled=TRUE "
+                "ORDER BY tenant_id, repository LIMIT %s",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_webhook_delivery(self, tenant_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT delivery_id, tenant_id, event_type, task_id, received_at "
+                "FROM webhook_deliveries WHERE tenant_id=%s "
+                "ORDER BY received_at DESC LIMIT 1",
+                (tenant_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def audit(
         self, tenant_id: str, actor: str, action: str, resource: str,

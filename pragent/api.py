@@ -6,15 +6,17 @@ import re
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .config import Settings
 from .auth import Principal
 from .github import verify_signature
 from .metrics import metrics
 from .modes import public_taxonomy, resolve_mode
+from .onboarding import OnboardingService, probe_github_cli
 from .report import to_markdown
 from .service import ReviewService
+from .watchdog import WatchPoller
 
 
 TASK = re.compile(r"^/v1/tasks/([0-9a-f-]+)$")
@@ -46,6 +48,8 @@ def read_guide() -> str:
 class ApiHandler(BaseHTTPRequestHandler):
     service: ReviewService
     settings: Settings
+    onboarding: OnboardingService
+    poller: Optional[WatchPoller] = None
     server_version = "PRAgent/0.3"
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -171,6 +175,22 @@ class ApiHandler(BaseHTTPRequestHandler):
         principal = self._authenticate_or_send("read")
         if principal is None:
             return
+        if path == "/v1/onboarding/status":
+            principal = self._principal("read")
+            self._send_json(200, self.onboarding.status(principal.tenant_id))
+            return
+        if path == "/v1/onboarding/repositories":
+            self._principal("manage")
+            self._send_json(200, {"repositories": self.onboarding.list_repositories(
+                int(query.get("limit", ["100"])[0])
+            )})
+            return
+        if path == "/v1/onboarding/webhook/await":
+            principal = self._principal("read")
+            self._send_json(200, {
+                "delivery": self.onboarding.latest_delivery(principal.tenant_id)
+            })
+            return
         if path == "/metrics":
             self._send_text(200, metrics.prometheus(), "text/plain; version=0.0.4; charset=utf-8")
             return
@@ -186,6 +206,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                                       "enabled": bool(self.service.llm_config),
                                       "provider": self.service.llm_config.get("provider", "local"),
                                       "model": self.service.llm_config.get("model", ""),
+                                  },
+                                  "polling": {
+                                      "enabled": self.poller is not None,
+                                      "interval_seconds": self.onboarding.watch_interval_seconds(),
+                                      "ticks": self.poller.ticks if self.poller else 0,
+                                      "last_summary": self.poller.last_summary if self.poller else {},
+                                      "last_error": self.poller.last_error if self.poller else "",
                                   },
                                   "run_mode": mode.to_dict(),
                                   "taxonomy": public_taxonomy()})
@@ -338,6 +365,38 @@ class ApiHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed_url.query)
         try:
             body = self._read_body(allow_empty=True)
+            if path == "/webhooks/github":
+                # Signature checked with the shared secret, so this endpoint must
+                # stay ahead of session authentication: GitHub cannot present a
+                # bearer token.
+                if self.headers.get("X-GitHub-Event", "") != "pull_request":
+                    self._send_json(202, {"ignored": True, "reason": "unsupported GitHub event"})
+                    return
+                secret = self.onboarding.webhook_secret()
+                if not secret:
+                    self._send_json(503, {"error": "GitHub webhook secret is not configured"})
+                    return
+                if not verify_signature(secret, body,
+                                        self.headers.get("X-Hub-Signature-256", "")):
+                    self._send_json(401, {"error": "invalid webhook signature"})
+                    return
+                payload = self._read_json(body)
+                updated_at = (payload.get("pull_request") or {}).get("updated_at")
+                if updated_at:
+                    try:
+                        event_time = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                    except ValueError:
+                        raise ValueError("invalid pull_request.updated_at")
+                    age = abs((datetime.now(timezone.utc) - event_time).total_seconds())
+                    if age > self.settings.webhook_max_age_seconds:
+                        self._send_json(409, {"error": "webhook is outside the replay window"})
+                        return
+                delivery_id = self.headers.get("X-GitHub-Delivery", "")
+                digest = hashlib.sha256(body).hexdigest()
+                self._send_json(202, self.service.handle_github_pull_request(
+                    payload, delivery_id, digest
+                ))
+                return
             if path == "/v1/auth/login":
                 if not self.settings.auth_required:
                     self._send_json(409, {"error": "authentication is disabled"})
@@ -352,6 +411,71 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self._send_json(401, {"error": str(exc)})
                     return
                 self._send_json(200, result)
+                return
+            if path == "/v1/onboarding/probe-gh":
+                self._principal("manage")
+                report = probe_github_cli()
+                self._send_json(200, {
+                    "found": report["found"],
+                    "account": report["account"],
+                    "scopes": report["scopes"],
+                    "token_masked": report["token_masked"],
+                    "missing_repo_scope": report["missing_repo_scope"],
+                    "reason": report["reason"],
+                })
+                return
+            if path == "/v1/onboarding/llm":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                result = self.onboarding.save_llm(
+                    str(payload.get("url", "")),
+                    str(payload.get("model", "")),
+                    str(payload.get("api_key", "")),
+                )
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "onboarding.llm",
+                    str(result.get("model", "")), {"provider": result.get("provider", "")},
+                )
+                self._send_json(200, result)
+                return
+            if path == "/v1/onboarding/github":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                source = str(payload.get("source", "") or "manual")
+                if source == "gh-cli":
+                    result = self.onboarding.adopt_github_cli()
+                else:
+                    result = self.onboarding.save_github_token(
+                        str(payload.get("token", "")), "manual",
+                    )
+                # Only the account name is audited; the token never reaches it.
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "onboarding.github",
+                    str(result.get("account", "")), {"source": source},
+                )
+                self._send_json(200, result)
+                return
+            if path == "/v1/onboarding/watches":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                result = self.onboarding.save_watches(
+                    principal.tenant_id, payload.get("watches", []),
+                )
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "onboarding.watches",
+                    "repositories",
+                    {"count": len(result.get("watches", []))},
+                )
+                self._send_json(200, result)
+                return
+            if path == "/v1/onboarding/webhook-secret":
+                principal = self._principal("manage")
+                result = self.onboarding.rotate_webhook_secret()
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "onboarding.webhook",
+                    "secret", {"rotated": True},
+                )
+                self._send_json(201, result)
                 return
             if path == "/v1/reviews":
                 principal = self._principal("review")
@@ -393,34 +517,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "mode": str(payload.get("mode", "")),
                     },
                 )
-                return
-            if path == "/webhooks/github":
-                if self.headers.get("X-GitHub-Event", "") != "pull_request":
-                    self._send_json(202, {"ignored": True, "reason": "unsupported GitHub event"})
-                    return
-                if not self.settings.github_webhook_secret:
-                    self._send_json(503, {"error": "GitHub webhook secret is not configured"})
-                    return
-                if not verify_signature(self.settings.github_webhook_secret, body,
-                                        self.headers.get("X-Hub-Signature-256", "")):
-                    self._send_json(401, {"error": "invalid webhook signature"})
-                    return
-                payload = self._read_json(body)
-                updated_at = (payload.get("pull_request") or {}).get("updated_at")
-                if updated_at:
-                    try:
-                        event_time = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-                    except ValueError:
-                        raise ValueError("invalid pull_request.updated_at")
-                    age = abs((datetime.now(timezone.utc) - event_time).total_seconds())
-                    if age > self.settings.webhook_max_age_seconds:
-                        self._send_json(409, {"error": "webhook is outside the replay window"})
-                        return
-                delivery_id = self.headers.get("X-GitHub-Delivery", "")
-                digest = hashlib.sha256(body).hexdigest()
-                self._send_json(202, self.service.handle_github_pull_request(
-                    payload, delivery_id, digest
-                ))
                 return
             match = FIX.match(path)
             if match:
@@ -605,16 +701,34 @@ def run() -> None:
     recovered = service.redispatch_pending()
     if recovered["redispatched"]:
         print("Re-queued %d undispatched task(s)" % len(recovered["redispatched"]))
-    handler = type("ConfiguredApiHandler", (ApiHandler,), {"service": service, "settings": settings})
+    onboarding = OnboardingService(service)
+    poller = (
+        WatchPoller(
+            service,
+            interval_seconds=settings.watch_poll_interval_seconds,
+            interval_getter=onboarding.watch_interval_seconds,
+        ) if settings.watch_poll_enabled else None
+    )
+    handler = type("ConfiguredApiHandler", (ApiHandler,), {
+        "service": service,
+        "settings": settings,
+        "onboarding": onboarding,
+        "poller": poller,
+    })
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
     print("PRAgent dashboard: http://%s:%d" % (settings.host, settings.port))
     print("Persistence: %s | Queue: %s | Orchestrator: %s" % (
         "postgresql" if settings.database_url else "sqlite", service.queue.backend, service.reviewer.name
     ))
+    if poller is not None:
+        poller.start()
+        print("Watching repositories every %d seconds" % poller.interval_seconds())
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if poller is not None:
+            poller.stop()
         service.queue.close()
         server.server_close()

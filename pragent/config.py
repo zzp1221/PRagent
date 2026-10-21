@@ -127,6 +127,8 @@ class Settings:
     context_recent_observations: int = 2
     context_map_chunk_tokens: int = 3000
     enabled_agents: str = "lead,security,correctness-reliability,critic"
+    watch_poll_enabled: bool = True
+    watch_poll_interval_seconds: int = 180
     llm_input_cost_per_million: float = 0.0
     llm_output_cost_per_million: float = 0.0
     evaluation_min_public_prs: int = 300
@@ -333,6 +335,10 @@ class Settings:
             enabled_agents=os.getenv(
                 "PRAGENT_ENABLED_AGENTS",
                 "lead,security,correctness-reliability,critic",
+            ),
+            watch_poll_enabled=_bool("PRAGENT_WATCH_POLL_ENABLED", True),
+            watch_poll_interval_seconds=_int(
+                "PRAGENT_WATCH_POLL_INTERVAL_SECONDS", 180
             ),
             llm_input_cost_per_million=float(
                 os.getenv("PRAGENT_LLM_INPUT_COST_PER_MILLION", "0")
