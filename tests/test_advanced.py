@@ -20,13 +20,29 @@ def settings(path):
     )
 
 
+def _remove_database(path: str) -> None:
+    """Delete a temporary database, retrying transient Windows handle contention.
+
+    A queued review can still hold the SQLite file when the test ends; Windows
+    briefly refuses the unlink and the test fails on cleanup rather than on the
+    behaviour it checks.
+    """
+    for _ in range(5):
+        try:
+            os.unlink(path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    os.unlink(path)
+
+
 class AdvancedFeatureTests(unittest.TestCase):
     def setUp(self):
         handle, self.path = tempfile.mkstemp(suffix=".db")
         os.close(handle)
 
     def tearDown(self):
-        os.unlink(self.path)
+        _remove_database(self.path)
 
     def test_deepseek_and_free_openrouter_provider_presets(self):
         deepseek = settings(self.path)
