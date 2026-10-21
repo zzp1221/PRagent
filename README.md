@@ -1,25 +1,91 @@
-# PRAgent PR Reviewer
+# PRAgent 多智能体代码审查
 
-- 审查统一 diff，输出结构化问题、修复建议和测试建议
-- GitHub `pull_request` webhook（`opened`、`reopened`、`synchronize`）
-- `agentic` 运行模式：Lead、Security、Correctness/Reliability、Critic 多 Agent 协作
-- SQLite 保存任务状态、执行轨迹和最终报告
-- JSON API 与 Markdown 报告
-- webhook HMAC-SHA256 签名校验，以及可选的 GitHub PR 评论回写
-- Web 管理台、任务 Dashboard 与 Prometheus 指标
-- 普通任务采用固定单轮多 Agent 协作（Lead 2 次、双 Worker 各 1 次、Critic 1 次，共 5 次 LLM 调用）；高风险任务最多允许一轮 Worker 返工
-- LLM unified patch、AST/CST、沙箱前后测试对比与仅 Draft PR 的修复闭环
-- PostgreSQL、Redis 生产模式
-- 失败案例回流、提示词评测、版本激活与回滚
-- 自研 Agent Runtime、持久化 checkpoint、执行预算与任务断点续跑
-- 带 Tool Registry、参数 Schema 校验和结构化 Observation 的 Agent Loop
-- 确认反馈的租户/仓库隔离记忆、检索与过期清理
-- Redis Streams ACK、Worker 租约、指数退避重试和死信队列
-- Webhook delivery 幂等、重放时间窗与评论 upsert
-- 用户登录、RBAC、租户/仓库隔离和不可变管理审计
-- 动态 Skill manifest 校验、签名校验和隔离进程沙箱
-- 自动修复后的编译/测试门禁、灰度发布与影子流量
-- OpenTelemetry Trace、Prometheus 指标和持久化告警
+PRAgent 把一次代码审查拆成一场可审计的多 Agent 协作：Lead 判定风险并分配任务，安全与正确性/可靠性两个 Worker 用仓库工具取证，Critic 盲审挑战结论，最后所有 finding 必须通过证据与置信度门禁才能发布。审查结果既回写 PR，也留在控制台里可追踪、可反馈、可回流成下一次的改进。
+
+正式审查入口是 `agentic` 模式，一次普通任务固定 5 次模型调用；高风险任务允许一轮 Worker 返工。每次调用的 token、耗时、证据引用与门禁结论都写进任务轨迹，报告里能直接看到钱花在哪、结论凭什么成立。
+
+![运行总览](docs/screenshots/overview.png)
+
+## 核心能力
+
+审查执行：
+
+- 统一 diff 解析，只定位新增代码与新文件行号，输出结构化问题、修复建议和测试建议
+- Agentic 协作：Lead + Security + Correctness/Reliability + Critic，高风险最多一轮返工
+- 带 Tool Registry、参数 Schema 校验和结构化 Observation 的 Agent Loop，Worker 可按需调用仓库工具取证
+- 自研 Agent Runtime：持久化 checkpoint、执行预算、任务断点续跑与取消
+- 质量门禁：格式、精确位置证据、强证据引用、置信度与发布条件，未通过的候选会在报告里单独披露
+
+集成与交付：
+
+- GitHub `pull_request` webhook（`opened`、`reopened`、`synchronize`），HMAC-SHA256 签名校验、幂等投递、重放时间窗与评论 upsert
+- 可选的 PR 评论回写；自动修复走独立的 Draft PR，只覆盖可确定安全的规则，验证通过后才提交到 `pragent/fix-pr-*` 分支
+- LLM unified patch、AST/CST、沙箱前后测试对比构成的修复闭环
+
+平台与运维：
+
+- Web 控制台：任务总览、发起审查、任务中心、Skills 清单、演进实验室，支持浅色/深色外观与移动端
+- SQLite 本地模式，PostgreSQL + Redis Streams 生产模式（ACK、租约、指数退避重试、死信队列）
+- 用户登录、RBAC、租户/仓库隔离与不可变审计日志
+- 动态 Skill manifest 校验、签名校验与隔离进程沙箱；Skill 版本可评测、门禁、激活与回滚
+- 失败案例回流、提示词与 Skill 演进评测、灰度发布与影子流量
+- OpenTelemetry Trace、Prometheus 指标与持久化告警
+
+## 架构
+
+![项目架构](image/architecture.png)
+
+![Agent 执行流程](image/agent-execution.png)
+
+两张图都有 draw.io 可编辑源文件与 SVG 矢量版本，说明见 [`image/README.md`](image/README.md)。图依据提交 `b4082fe` 绘制，之后的门禁语义与报告输出有调整，主干流程未变。
+
+```text
+HTTP / GitHub Webhook
+        │
+        ▼
+ ReviewService ── TaskStore(SQLite / PostgreSQL)
+        │
+        ▼
+        ReviewHarness (PRAgent Runtime / checkpoint / resume / budget / trace)
+        │
+        ├── DiffParser
+        ├── Redis Streams / ACK / lease / retry / DLQ
+        └── Agentic Lead/Workers
+              ├── Lead：一次任务分配并判定风险；高风险时最多请求一轮返工；最终综合
+              ├── Security Worker：输入/权限/敏感数据/危险调用链
+              ├── Correctness/Reliability Worker：状态/异常/并发/资源/兼容性
+              ├── Critic Worker：一次性盲审、反例与证据挑战
+              └── Gates：格式、证据、置信度和发布门禁
+```
+
+## Web 控制台
+
+服务启动后打开 `http://127.0.0.1:8080/`。前端是零构建的静态资源（`web/` 目录直接由 API 进程托管），不需要 Node 工具链；业务 API 返回未授权状态后弹登录层，登录状态保存在当前浏览器的 `localStorage` 中。
+
+| 页面 | 用途 |
+|---|---|
+| 运行总览 | 任务量、成功率、未解决反馈与 Skill 版本概况，最近任务一键进入报告 |
+| 发起审查 | 粘贴或拖入 diff 文件，实时统计行数与字符数，按需放入异步队列 |
+| 任务中心 | 按仓库、PR 编号与状态搜索筛选；报告默认优先展示问题，执行详情、预算与门禁事实可展开 |
+| Skills | 查看已加载的审查能力、用途与允许工具，可触发重新扫描 |
+| 演进实验室 | 从反馈生成候选版本，查看评测门禁结论与激活状态 |
+
+<table>
+<tr>
+<td><img src="docs/screenshots/review.png" alt="发起审查"></td>
+<td><img src="docs/screenshots/tasks-report.png" alt="任务中心与报告"></td>
+</tr>
+<tr>
+<td><img src="docs/screenshots/skills.png" alt="Skills 清单"></td>
+<td><img src="docs/screenshots/evolution.png" alt="演进实验室"></td>
+</tr>
+<tr>
+<td><img src="docs/screenshots/dark-overview.png" alt="深色外观"></td>
+<td><img src="docs/screenshots/mobile-overview.png" alt="移动端布局"></td>
+</tr>
+</table>
+
+页面支持系统外观跟随与手动主题切换（刷新后保持）、键盘可达的跳转链接与焦点管理，`1366 / 1280 / 1024 / 768 / 390 / 360` 六种宽度下无横向溢出。
 
 ## 快速开始
 
@@ -42,9 +108,7 @@ python -m pragent
 
 Bootstrap 管理员只在用户名尚不存在时创建；已有同名用户的密码不会在重启时被覆盖。
 
-服务默认监听 `127.0.0.1:8080`。启动后打开 `http://127.0.0.1:8080/`，前端会在业务 API 返回未授权状态后显示登录层。登录状态保存在当前浏览器的 `localStorage` 中；需要重新登录时可以点击退出，或清除站点数据。
-
-API 调用需要先登录并携带 Bearer Token：
+服务默认监听 `127.0.0.1:8080`。API 调用需要先登录并携带 Bearer Token：
 
 ```powershell
 $session = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/v1/auth/login `
@@ -237,6 +301,25 @@ ngrok http 8080
 
 上述快捷转发会把 8080 端口上的管理台和 API 一并暴露到公网，因此必须保持 `PRAGENT_AUTH_REQUIRED=true`，并使用强管理员密码和随机 `PRAGENT_AUTH_SECRET`。长期部署建议通过反向代理只公开 `/webhooks/github`（以及按需公开 `/health`），不要向公网暴露整个管理台。
 
+#### 带白名单网关的 quick tunnel
+
+仓库自带 `tunnel-quick.ps1`，把“只放行必要路径的网关 + quick tunnel + 回写 `.env` + 重建容器”整条链路串起来，避免把整个管理台暴露到公网：
+
+```powershell
+# 启动网关(默认 8081) → cloudflared → 校验公网 /health → 写 PRAGENT_PUBLIC_BASE_URL → 重建 pragent 容器
+powershell -ExecutionPolicy Bypass -File tunnel-quick.ps1
+
+# 只改 .env，不重建容器
+powershell -ExecutionPolicy Bypass -File tunnel-quick.ps1 -SkipCompose
+
+# 停止网关与隧道
+powershell -ExecutionPolicy Bypass -File tunnel-quick.ps1 -Stop
+```
+
+隧道前面的 [`tunnel-gateway.js`](tunnel-gateway.js) 默认只转发 `/webhooks/github` 与 `/health`，其余路径直接返回 404 并记录到 `tunnel-access.log`；需要公网管理台时加 `-ExposeAdmin`。脚本需要 `cloudflared`（默认 `D:\cloudflared\cloudflared.exe`，可用 `-CloudflaredPath` 改）与 Node.js，本地端口从 `.env` 的 `PRAGENT_HTTP_PORT` 读取。
+
+quick tunnel 的域名每次启动都会变，脚本会把新地址写回 `.env` 的 `PRAGENT_PUBLIC_BASE_URL`，但 GitHub 上的 Payload URL 仍需手动同步。
+
 #### 长期稳定的 named tunnel
 
 quick tunnel 的域名随机且进程一停就失效，只适合一次性验证。需要固定地址时用绑定自有域名的 named tunnel，项目自带脚本把整条链路自动化：
@@ -280,6 +363,18 @@ Invoke-RestMethod https://<公网域名>/health
 
 默认只在管理台保存结果。只有 `PRAGENT_AUTO_POST_REVIEW=true` 时才会向 PR 回写评论。
 
+## 质量门禁与报告
+
+每条候选结论在落地前都要过 FindingGate，未通过的候选不会静默消失，报告会把它们单独列出来：
+
+- 格式门禁：严重性、文件路径、行号、修复建议缺一不可；
+- 位置证据：finding 指向的行必须能在新增代码里对上；
+- 证据门禁：高风险结论需要 AST、扫描器或调用链证据，且引用必须回溯到真实工具调用；
+- 置信度门禁：低于阈值的候选不发布；但如果 Lead 已经看过 Critic 的反对意见并明确选择发布，这一判断会被记录（`lead_accepted`）并优先于阈值，避免整场协作的结论在最后一步被无声丢弃；
+- 发布门禁：`critical`/`high` 结论还要求对应等级的验证记录。
+
+Markdown 报告的协作摘要统计的是 Critic 之前的候选数（`candidate_findings_before_critic`），与被拦下的数量分开计数。当所有候选都被门禁挡下时，报告不再输出“没发现问题”，而是列出每条候选及其拦截原因——一份空的审查报告和一份干净的审查报告必须能区分开。控制台的任务详情会把这些事实渲染成门禁卡片：位置证据是否命中、强证据数、已验证/未验证引用数与最终结论。
+
 自动修复只覆盖可确定安全的规则，例如调试输出、`shell=True` 和硬编码 Python 凭据；结果始终提交到新的 `pragent/fix-pr-*` 分支，不直接修改源分支。
 
 ## API
@@ -318,28 +413,7 @@ Invoke-RestMethod https://<公网域名>/health
 | `POST` | `/v1/queue/dead-letters/replay` | 重放死信任务 |
 | `GET/POST` | `/api/deployments/llm-review`、`/v1/deployments/llm-review` | 查询或配置灰度/影子发布 |
 
-`POST /v1/reviews` 的 `diff` 最大默认 1 MiB；单任务默认最多 8 步、120 秒。可通过环境变量调整，详见 `.env.example`。
-
-## 架构
-
-```text
-HTTP / GitHub Webhook
-        │
-        ▼
- ReviewService ── TaskStore(SQLite / PostgreSQL)
-        │
-        ▼
-        ReviewHarness (PRAgent Runtime / checkpoint / resume / budget / trace)
-        │
-        ├── DiffParser
-        ├── Redis Streams / ACK / lease / retry / DLQ
-        └── Agentic Lead/Workers
-              ├── Lead：一次任务分配并判定风险；高风险时最多请求一轮返工；最终综合
-              ├── Security Worker：输入/权限/敏感数据/危险调用链
-              ├── Correctness/Reliability Worker：状态/异常/并发/资源/兼容性
-              ├── Critic Worker：一次性盲审、反例与证据挑战
-              └── Gates：格式、证据、置信度和发布门禁
-```
+`POST /v1/reviews` 的 `diff` 最大默认 1 MiB；单任务默认最多 8 步、120 秒。可通过环境变量调整，详见 `.env.example`。`cancel`、`resume`、`skills/reload`、死信重放这类不需要请求体的 POST 可以直接空 body 调用。
 
 ## Skills 的定位与编写方式
 
@@ -377,3 +451,28 @@ Finding gate 校验格式、证据、置信度和发布条件
 因此，把 Skill 内容直接硬编码到全局上下文并不能完全等价：那会让每个任务都携带全部领域规则，增加上下文长度和相互干扰；Skill 机制可以按任务选择、限制工具权限、热加载版本，并通过 `/v1/skill-evolution/*` 做候选评测、门禁和回滚。对于只有一两句、没有独立选择价值的规则，直接放在全局 prompt 更合适；只有当一组规则有清晰边界、需要按场景启用或需要独立演进时，才应该做成 Skill。
 
 本仓库的内置 Skill 已按上述结构补充了完整的 Mission、Review procedure、Checklist、Evidence/severity、Remediation/verification 和 Output contract。新增 Skill 时可复制其中一个目录，再根据领域替换这些章节，并用 `POST /v1/skills/reload` 让新任务加载最新版本。
+
+## 项目结构
+
+```text
+pragent/                 运行时、编排、门禁、存储与可观测性
+├── api.py               HTTP 入口、路由、鉴权与静态资源
+├── service.py           审查服务与任务编排
+├── harness.py           Runtime 外壳：checkpoint / resume / 预算 / trace
+├── agentic_core.py      Lead / Worker / Critic 协作协议
+├── gates.py             finding 门禁
+├── runtime.py           Agent Loop 与 Tool Registry
+├── task_queue.py        Redis Streams 消费、租约与重试
+├── store.py             SQLite / PostgreSQL 持久化
+└── config.py            环境变量与默认值
+skills/                  内置审查 Skill 包
+web/                     零构建前端（index.html / app.js / app.css / login.css）
+tests/                   unittest 测试集
+image/                   架构图（draw.io / PNG / SVG）
+docs/screenshots/        控制台截图
+scripts/                 评测与实验脚本
+deploy.ps1, deploy.sh    Docker 一键部署
+tunnel.ps1               固定域名 named tunnel 自动化
+tunnel-quick.ps1         quick tunnel + 白名单网关自动化
+tunnel-gateway.js        只转发 /webhooks/github 与 /health 的网关
+```
