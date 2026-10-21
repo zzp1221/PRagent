@@ -130,9 +130,6 @@ class ReviewService:
             extra_headers=dict(llm_config.get("headers") or {}),
         )
 
-    def _build_llm_reviewer(self, prompt: str = "") -> OpenAICompatibleReviewer:
-        return self._llm_reviewer(self.llm_config, self.effective_settings, prompt)
-
     def _install_llm_runtime(self, effective: Settings) -> None:
         """Assemble every model-dependent component from one settings snapshot.
 

@@ -74,8 +74,9 @@
 - [x] 更新 `README.md` 增加一键接入章节
 - [x] 更新 `.env.example` 增加轮询配置项
 - [x] 确认未改动 `tunnel.ps1`、`tunnel-quick.ps1`
-- [ ] 提交并推送分支
-- [ ] 在 `zzp1221/PRagent` 提真实 PR，附验证证据
+- [x] 提交并推送分支（`feat/bat-onboarding-poll`）
+- [x] 在 `zzp1221/PRagent` 提真实 PR：https://github.com/zzp1221/PRagent/pull/2
+- [x] 清理重构遗留的死代码（`_build_llm_reviewer` 已无调用者）
 
 ## 验收对照
 
