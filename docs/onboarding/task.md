@@ -68,6 +68,8 @@
 - [x] `tests/test_polled_review.py`（7 项）
 - [x] 全量 `python -m unittest discover -s tests`：176 项通过
 - [x] 端到端冒烟：起真服务验证 `/health`、`/v1/onboarding/status`、`/api/dashboard`
+- [x] 真实仓库闭环：用 `start.bat` 启动，向导订阅 `zzp1221/claude-code-pet`，轮询自动审查 3 个 open PR 并回写评论
+- [x] 审查有效性交叉验证：PRAgent 在 https://github.com/zzp1221/claude-code-pet/pull/3 上发现 `PET_BACKUP_KEEP` 负值会删光备份，修复后第三轮结论转为 `low`
 
 ## 阶段 8：文档与交付
 
