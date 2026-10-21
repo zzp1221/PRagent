@@ -23,25 +23,29 @@ cd /d "%ROOT%" 2>nul
 if errorlevel 1 goto :no_dir
 
 rem --- 1. 定位 Python：随包运行时优先，其次系统安装 ---
+rem 所有分支只负责设置变量，回显放到块外，否则 %VAR% 会在块解析时被提前展开成空值。
 set "PY_EXE="
+set "PY_LABEL="
+
 if exist "%ROOT%\runtime\python\python.exe" (
   set "PY_EXE="%ROOT%\runtime\python\python.exe""
-  echo   [1/3] 使用随包 Python 运行时
-) else (
+  set "PY_LABEL=随包 Python 运行时"
+)
+
+if not defined PY_EXE (
   for /f "delims=" %%i in ('where python 2^>nul') do (
     if not defined PY_EXE set "PY_EXE="%%i""
   )
-  if defined PY_EXE (
-    echo   [1/3] 使用系统 Python: %PY_EXE%
-  ) else (
-    where py >nul 2>nul
-    if not errorlevel 1 (
-      set "PY_EXE=py -3.11"
-      echo   [1/3] 使用 Windows Python Launcher
-    )
-  )
 )
+
+if not defined PY_EXE (
+  where py >nul 2>nul
+  if not errorlevel 1 set "PY_EXE=py -3.11"
+)
+
+if defined PY_EXE if not defined PY_LABEL set "PY_LABEL=系统 Python"
 if not defined PY_EXE goto :no_python
+echo   [1/3] 使用 %PY_LABEL%
 
 %PY_EXE% -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>nul
 if errorlevel 1 goto :old_python

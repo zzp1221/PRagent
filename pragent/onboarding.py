@@ -138,12 +138,14 @@ class OnboardingService:
         return self._get(KEY_WEBHOOK_SECRET) or self.settings.github_webhook_secret
 
     def watch_interval_seconds(self) -> int:
+        """Effective poll interval: wizard value, then the configured default."""
+        fallback = self.settings.watch_poll_interval_seconds or DEFAULT_WATCH_INTERVAL_SECONDS
         raw = self._get(KEY_WATCH_INTERVAL, "")
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return DEFAULT_WATCH_INTERVAL_SECONDS
-        return value if value >= MIN_WATCH_INTERVAL_SECONDS else DEFAULT_WATCH_INTERVAL_SECONDS
+            return fallback
+        return value if value >= MIN_WATCH_INTERVAL_SECONDS else fallback
 
     # --- status -------------------------------------------------------------
 
