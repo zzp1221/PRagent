@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r requirements.txt
 COPY pragent ./pragent
 COPY web ./web
 COPY skills ./skills
+# The console renders the user guide from this file at request time, so the
+# image needs it too. Only the guide ships, not the internal docs tree.
+COPY docs/USER_GUIDE.md ./docs/USER_GUIDE.md
 
 # The service runs unprivileged; /app/data holds the SQLite fallback and volatile artifacts.
 RUN groupadd --gid 10001 pragent \

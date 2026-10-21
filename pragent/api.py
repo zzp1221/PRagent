@@ -29,6 +29,18 @@ SKILL_ARTIFACT_ACTIVATE = re.compile(
     r"^/v1/skill-evolution/([a-z0-9_-]+)/versions/(\d+)/activate$"
 )
 WEB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
+DOCS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "docs"))
+GUIDE_FILE = "USER_GUIDE.md"
+
+
+def read_guide() -> str:
+    """Return the user guide the console renders in its help view.
+
+    The guide lives next to the source so the file stays the single copy that
+    both the repository and the running console display.
+    """
+    with open(os.path.join(DOCS_ROOT, GUIDE_FILE), "r", encoding="utf-8") as handle:
+        return handle.read()
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -133,6 +145,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         if path == "/assets/app.js":
             self._serve_file("app.js")
+            return
+        if path == "/guide":
+            # Served without auth: someone who cannot log in yet still needs the
+            # instructions for how to get in.
+            try:
+                text = read_guide()
+            except OSError:
+                self._send_json(404, {"error": "not found"})
+                return
+            self._send_text(200, text, "text/markdown; charset=utf-8")
             return
         if path == "/health":
             mode = resolve_mode(

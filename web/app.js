@@ -7,6 +7,7 @@ const titles = {
   tasks: "任务中心",
   skills: "Skill 注册中心",
   evolution: "演进实验室",
+  guide: "使用说明",
 };
 
 const subtitles = {
@@ -15,6 +16,7 @@ const subtitles = {
   tasks: "查找审查任务，查看问题详情与处理建议",
   skills: "了解每项审查能力的用途与当前配置",
   evolution: "根据审查反馈评测改进方案，查看版本效果",
+  guide: "从第一次审查到读懂报告，按步骤说明如何操作",
 };
 
 const stateLabels = {
@@ -128,6 +130,7 @@ function show(view, updateHash = true) {
   if (view === "tasks") loadTasks();
   if (view === "skills") loadSkills();
   if (view === "evolution") loadFailures();
+  if (view === "guide") loadGuide();
   window.scrollTo({ top: 0, behavior: reduceMotion.matches ? "auto" : "smooth" });
 }
 
@@ -1209,6 +1212,186 @@ diffInput.addEventListener("drop", (event) => {
 });
 
 if (accessToken) $("#logout").classList.remove("hidden");
+
+/* 使用说明：渲染仓库里的 docs/USER_GUIDE.md。
+   手册只保留一份文件，仓库和控制台读的是同一份内容。 */
+
+const guideState = { html: "", toc: [], loaded: false };
+
+function inlineMarkdown(text) {
+  // Escape first: the replacements below are the only real tags in the output.
+  let value = escapeHtml(text);
+  value = value.replace(/`([^`]+)`/g, "<code>$1</code>");
+  value = value.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  value = value.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, href) => {
+    if (!/^(https?:\/\/|\.{0,2}\/)/.test(href)) return label;
+    const external = href.startsWith("http");
+    return `<a href="${href}"${external ? ' target="_blank" rel="noopener noreferrer"' : ""}>${label}</a>`;
+  });
+  return value;
+}
+
+function splitTableRow(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function renderGuideMarkdown(source) {
+  const lines = String(source).replace(/\r\n/g, "\n").split("\n");
+  const blocks = [];
+  const toc = [];
+  let index = 0;
+  let section = 0;
+
+  // A paragraph ends where the next block-level construct starts.
+  const startsBlock = (line) =>
+    /^(#{1,3}\s|```|>|\|)/.test(line) || /^\s*([-*]|\d+\.)\s+/.test(line);
+
+  while (index < lines.length) {
+    const line = lines[index];
+
+    if (line.startsWith("```")) {
+      const language = line.slice(3).trim();
+      const body = [];
+      index += 1;
+      while (index < lines.length && !lines[index].startsWith("```")) {
+        body.push(lines[index]);
+        index += 1;
+      }
+      index += 1;
+      blocks.push(
+        `<pre class="guide-code"${language ? ` data-lang="${escapeHtml(language)}"` : ""}>` +
+        `<code>${escapeHtml(body.join("\n"))}</code></pre>`
+      );
+      continue;
+    }
+
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
+    if (heading) {
+      const level = heading[1].length;
+      const text = heading[2].trim();
+      if (level === 1) {
+        blocks.push(`<h1 class="guide-title">${inlineMarkdown(text)}</h1>`);
+      } else {
+        section += 1;
+        const id = `guide-section-${section}`;
+        blocks.push(`<h${level} id="${id}">${inlineMarkdown(text)}</h${level}>`);
+        toc.push({ id, level, text: text.replace(/[`*]/g, "") });
+      }
+      index += 1;
+      continue;
+    }
+
+    if (line.startsWith("|") && /^\|[\s:|-]*\|$/.test((lines[index + 1] || "").trim())) {
+      const header = splitTableRow(line);
+      index += 2;
+      const rows = [];
+      while (index < lines.length && lines[index].startsWith("|")) {
+        rows.push(splitTableRow(lines[index]));
+        index += 1;
+      }
+      const head = header.map((cell) => `<th>${inlineMarkdown(cell)}</th>`).join("");
+      const body = rows
+        .map((row) => `<tr>${row.map((cell) => `<td>${inlineMarkdown(cell)}</td>`).join("")}</tr>`)
+        .join("");
+      blocks.push(
+        `<div class="guide-table"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`
+      );
+      continue;
+    }
+
+    if (line.startsWith(">")) {
+      const quoted = [];
+      while (index < lines.length && lines[index].startsWith(">")) {
+        quoted.push(lines[index].replace(/^>\s?/, ""));
+        index += 1;
+      }
+      blocks.push(`<blockquote>${inlineMarkdown(quoted.join(" "))}</blockquote>`);
+      continue;
+    }
+
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*[-*]\s+/, ""));
+        index += 1;
+      }
+      blocks.push(`<ul>${items.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ul>`);
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*\d+\.\s+/, ""));
+        index += 1;
+      }
+      blocks.push(`<ol>${items.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ol>`);
+      continue;
+    }
+
+    const paragraph = [];
+    while (index < lines.length && lines[index].trim() && !startsBlock(lines[index])) {
+      paragraph.push(lines[index].trim());
+      index += 1;
+    }
+    if (paragraph.length) {
+      blocks.push(`<p>${inlineMarkdown(paragraph.join(" "))}</p>`);
+    } else {
+      // Anything the subset does not model still reaches the reader as text.
+      blocks.push(`<p>${inlineMarkdown(line.trim())}</p>`);
+      index += 1;
+    }
+  }
+
+  return { html: blocks.join("\n"), toc };
+}
+
+function renderGuide() {
+  const root = $("#guide-body");
+  if (!root) return;
+  root.innerHTML = guideState.html;
+  const toc = $("#guide-toc");
+  if (!toc) return;
+  toc.innerHTML = guideState.toc.map((item) =>
+    `<button class="guide-toc-item level-${item.level}" type="button" data-target="${item.id}">` +
+    `${escapeHtml(item.text)}</button>`
+  ).join("");
+  $$(".guide-toc-item", toc).forEach((button) => {
+    button.addEventListener("click", () => {
+      document.getElementById(button.dataset.target)?.scrollIntoView({
+        behavior: reduceMotion.matches ? "auto" : "smooth", block: "start",
+      });
+      $$(".guide-toc-item", toc).forEach((item) => item.classList.toggle("is-active", item === button));
+    });
+  });
+}
+
+async function loadGuide(force = false) {
+  const root = $("#guide-body");
+  if (!root) return;
+  if (guideState.loaded && !force) {
+    renderGuide();
+    return;
+  }
+  root.innerHTML = '<div class="list-loading"></div><div class="list-loading"></div>';
+  try {
+    const text = await api("/guide");
+    const { html, toc } = renderGuideMarkdown(text);
+    guideState.html = html;
+    guideState.toc = toc;
+    guideState.loaded = true;
+    renderGuide();
+  } catch (error) {
+    root.innerHTML = `<div class="empty-state"><span><b>手册读取失败</b>${escapeHtml(error.message)}。可以刷新页面重试。</span></div>`;
+    const toc = $("#guide-toc");
+    if (toc) toc.innerHTML = "";
+  }
+}
 
 function applyTheme(theme) {
   const dark = theme === "dark";

@@ -7,8 +7,8 @@
   <title>PRAgent · 代码审查控制台</title>
   <meta name="description" content="PRAgent 多智能体代码审查、自动修复与 Skill 演进控制台">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23e8834a'/%3E%3Cpath d='M12 24V9h6.2a4.2 4.2 0 0 1 0 8.4H12' stroke='%231a1108' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/assets/app.css?v=4">
-  <link rel="stylesheet" href="/assets/login.css?v=4">
+  <link rel="stylesheet" href="/assets/app.css?v=5">
+  <link rel="stylesheet" href="/assets/login.css?v=5">
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主内容</a>
@@ -44,6 +44,11 @@
         <button class="nav-item" data-view="evolution" type="button" title="演进实验室：用反馈评测与改进审查效果">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3.5 16.8 5-5 3.6 3.6L20.5 7"/><path d="M15.4 7h5.1v5.1"/></svg>
           <span>演进实验室<small>用反馈改进审查效果</small></span>
+        </button>
+        <p class="nav-group-label nav-group-secondary">帮助</p>
+        <button class="nav-item" data-view="guide" type="button" title="使用说明：从第一次审查到读懂报告">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5.2A2.2 2.2 0 0 1 6.2 3H19v15.6H6.2A2.2 2.2 0 0 0 4 20.8Z"/><path d="M4 18.6a2.2 2.2 0 0 1 2.2-2.2H19"/><path d="M8.4 7.4h6.4"/></svg>
+          <span>使用说明<small>每一步该怎么操作</small></span>
         </button>
       </nav>
 
@@ -282,6 +287,20 @@
               </form>
           </details>
         </section>
+
+        <section class="view" id="view-guide" aria-labelledby="page-title">
+          <div class="guide-layout">
+            <aside class="panel guide-toc" aria-label="手册目录">
+              <h2 class="panel-title">目录</h2>
+              <nav id="guide-toc" class="guide-toc-list"></nav>
+            </aside>
+            <article class="panel guide-panel">
+              <div id="guide-body" class="guide-body">
+                <div class="list-loading"></div><div class="list-loading"></div>
+              </div>
+            </article>
+          </div>
+        </section>
       </main>
     </div>
   </div>
@@ -305,6 +324,6 @@
   </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="/assets/app.js?v=4"></script>
+  <script src="/assets/app.js?v=5"></script>
 </body>
 </html>
