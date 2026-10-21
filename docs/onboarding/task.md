@@ -58,7 +58,7 @@
 
 - [x] `start.bat`：Python 探测、pushd 规范化目录、端口占用处理
 - [x] 四种失败场景的中文提示（实测无 Python 与端口占用两条分支）
-- [ ] `start-linux.sh`（非目标，README 已注明仅提供 Windows 一键入口）
+- [x] 确认 `start-linux.sh` 属于非目标：`specify.md` 的"不包含"已列出，README 只承诺 Windows 一键入口
 
 ## 阶段 7：验证
 

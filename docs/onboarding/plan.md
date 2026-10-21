@@ -146,14 +146,16 @@ class WatchPoller(threading.Thread, daemon=True):
 |---|---|---|
 | GET | `/v1/onboarding/status` | 汇总：模型、GitHub、webhook 可用性、已订阅仓库、轮询间隔 |
 | POST | `/v1/onboarding/probe-gh` | 探测本机 gh，返回 found/account/scopes/token_masked/reason |
-| PUT | `/v1/onboarding/llm` | 保存模型三项并验证，成功后热生效 |
-| PUT | `/v1/onboarding/github` | 保存 token（来源 manual 或 gh-cli），并立即校验可读用户 |
+| POST | `/v1/onboarding/llm` | 保存模型三项并验证，成功后热生效 |
+| POST | `/v1/onboarding/github` | 保存 token（来源 manual 或 gh-cli），并立即校验可读用户 |
 | GET | `/v1/onboarding/repositories` | 用当前 token 列仓库 |
-| PUT | `/v1/onboarding/watches` | 全量替换订阅集合，同步写授权白名单 |
+| POST | `/v1/onboarding/watches` | 全量替换订阅集合，同步写授权白名单 |
 | POST | `/v1/onboarding/webhook-secret` | 生成并保存 webhook secret，返回明文一次 |
-| POST | `/v1/onboarding/webhook/await` | 短轮询等待首个 webhook 事件到达（验证连通性） |
+| GET | `/v1/onboarding/webhook/await` | 查询最近一次投递，用于验证 webhook 连通性 |
 
-敏感字段一律不出现在响应里。`PUT /v1/onboarding/llm` 的验证方式是构造临时 `JsonChatClient` 调一次 `complete_json`，用极小 prompt 要求返回固定 JSON。
+全部写操作用 POST：项目既有的 `ApiHandler` 只实现了 `do_GET` 与 `do_POST`，新增 `do_PUT` 会扩大请求面而没有收益。
+
+敏感字段一律不出现在响应里。`POST /v1/onboarding/llm` 的验证方式是构造临时 `JsonChatClient` 调一次 `complete_json`，用极小 prompt 要求返回固定 JSON。
 
 ## 公网判定
 

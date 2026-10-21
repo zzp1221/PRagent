@@ -70,7 +70,7 @@ webhook 与轮询同时开启时，同一 `(repository, head_sha)` 只审查一�
 
 ### AC-1 模型配置
 
-`PUT /v1/onboarding/llm` 提交有效配置后，`GET /v1/onboarding/status` 的 `llm.configured` 为 true；紧接着通过 `POST /v1/reviews` 提交的审查任务使用新配置的模型，`/health` 的 `llm_model` 反映新值，且进程未重启。
+`POST /v1/onboarding/llm` 提交有效配置后，`GET /v1/onboarding/status` 的 `llm.configured` 为 true；紧接着通过 `POST /v1/reviews` 提交的审查任务使用新配置的模型，`/health` 的 `llm_model` 反映新值，且进程未重启。
 
 提交无效 api key 时返回 4xx 与可读错误信息，`llm.configured` 保持原值不变。
 
@@ -80,7 +80,7 @@ webhook 与轮询同时开启时，同一 `(repository, head_sha)` 只审查一�
 
 gh 不可用时返回 `found=false` 与失败原因分类，HTTP 状态码仍为 200（探测失败不是接口错误）。
 
-通过 `PUT /v1/onboarding/github` 粘贴 token 后，`GET /v1/onboarding/repositories` 返回该 token 可见的仓库列表。
+通过 `POST /v1/onboarding/github` 粘贴 token 后，`GET /v1/onboarding/repositories` 返回该 token 可见的仓库列表。
 
 ### AC-3 轮询自动审查
 
