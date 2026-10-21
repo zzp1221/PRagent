@@ -18,3 +18,12 @@ __pycache__/
 data/
 .task_id
 nohup.out
+
+# Cloudflare tunnel state (pids, logs, access trail)
+.tunnel/
+tunnel-access.log
+
+# Local capture scratch space and pre-redesign asset backups
+.ui-shots/
+.docker-web-backup/
+
