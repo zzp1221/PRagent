@@ -90,6 +90,70 @@ HTTP / GitHub Webhook
 
 页面支持系统外观跟随与手动主题切换（刷新后保持）、键盘可达的跳转链接与焦点管理，`1366 / 1280 / 1024 / 768 / 390 / 360` 六种宽度下无横向溢出。
 
+## 两种自动审查的接入方式
+
+PRAgent 有两条独立的路把"有人提了 PR"变成"开始审查"。它们的前置条件完全不同，按你手上有什么来选，也可以同时开启。
+
+| | 轮询（默认） | Webhook |
+|---|---|---|
+| 触发方式 | 后台线程定时扫描 open PR | GitHub 主动推送事件 |
+| 时延 | 分钟级，默认 180 秒 | 秒级 |
+| 前置条件 | 一个 GitHub 令牌 | 一个 GitHub 能访问到的公网 HTTPS 地址 |
+| 需要公网地址或域名 | 不需要 | 需要 |
+| 进程停机期间产生的事件 | 下一轮扫描补上，不会丢 | 丢失，重投窗口只有 600 秒 |
+| 适合的运行位置 | 个人电脑、内网、笔记本 | 常驻的公网服务器 |
+
+### 方式一：轮询（`start.bat` 一键启动）
+
+不需要公网地址、域名或隧道，只需要能出网。这是单机使用的默认方式。
+
+1. 双击 `start.bat`。它会定位 Python（优先 `runtime\python\python.exe`，其次系统 Python 3.11+），把工作目录固定到脚本所在位置，启动服务并打开浏览器。
+2. 向导第一步填模型：接口地址、模型名、API Key，点"测试并保存"。保存时会真实调用一次接口，通过后立即生效，不用重启。
+3. 向导第二步连 GitHub：自动识别本机 GitHub CLI 登录，识别不到就粘贴一个具备 `repo` 权限的令牌，两条路等价。
+4. 向导第三步勾选仓库并保存。后台线程开始按间隔扫描这些仓库的 open PR。
+
+之后有人提 PR，下一轮扫描就会创建审查任务，结论回写到该 PR 的评论。
+
+**怎么确认它在工作**：`GET /api/dashboard` 的 `polling` 字段有 `ticks`（已经扫描的轮数）和 `last_summary`（本轮提交了几次审查、跳过几次重复）。`GET /v1/onboarding/status` 的 `watches[].last_sha` 是每个仓库最近一次已提交审查的 commit。
+
+轮询的幂等键是 `(仓库, head commit)`。同一个 PR 没有人推新提交就不会被重复审查；推了新提交才会重新审，因为审查对象是代码不是 PR 编号。已关闭的 PR 不再出现在 `state=open` 的列表里，自然不再扫描。
+
+### 方式二：Webhook（秒级）
+
+需要 `PRAGENT_PUBLIC_BASE_URL` 是一个公网 HTTPS 地址，因为 GitHub 要主动往这个地址 POST 事件。
+
+1. 确认 `PRAGENT_PUBLIC_BASE_URL` 是公网 HTTPS。仍是 `http://127.0.0.1:8080` 或私有网段时，向导会把 webhook 区域显示为不可用并说明原因，而不是让你配一个收不到事件的地址。
+2. 在向导里生成 Secret。页面同时给出完整的 Payload URL。
+3. 打开目标仓库的 Settings → Webhooks → Add webhook：
+   - Payload URL 填向导给出的地址，形如 `https://<你的域名>/webhooks/github`
+   - Content type 选 `application/json`
+   - Secret 填上一步生成的值
+   - 事件只勾 Pull requests
+4. 点向导里的"等待首个事件"，然后在仓库里开一个 PR。收到事件后页面会显示投递编号，说明这条链路通了。
+
+公网转发、fine-grained PAT 的权限范围、以及不开向导时纯环境变量的配法，见下方 [GitHub Webhook](#github-webhook) 章节。`/webhooks/github` 用 HMAC 签名认证，不走用户登录，所以开启 `PRAGENT_AUTH_REQUIRED` 也不会把它挡住。
+
+### 同时开启会怎样
+
+不冲突，也不重复审查。轮询和 webhook 共用同一个去重键 `(租户, 仓库, head commit)`，谁先到谁创建任务，后到的那个记一次重复就跳过。
+
+推荐同时开启：webhook 负责秒级响应，轮询负责补齐 webhook 漏掉的事件——进程重启、网络抖动、超过 600 秒重投窗口的投递，都只有轮询能兜住。
+
+### 两种方式都不用手改环境变量
+
+向导写入的配置保存在数据库里（`runtime_settings` 与 `repository_watches` 两张表），不写回 `.env`。这些值包含模型密钥与 GitHub 令牌，应按凭据文件对待。
+
+要注意进程环境变量优先于 `.env`：如果 shell 里已经 export 了 `PRAGENT_AUTO_POST_REVIEW` 之类的变量，`.env` 里的同名值不会生效。判断实际生效值用 `GET /v1/onboarding/status`，它读的是运行中的配置。
+
+### 自动扫描的开关
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `PRAGENT_WATCH_POLL_ENABLED` | `true` | 关闭后台轮询线程 |
+| `PRAGENT_WATCH_POLL_INTERVAL_SECONDS` | `180` | 轮询间隔，向导里保存的值优先 |
+
+单个仓库轮询失败不会影响其他仓库，失败原因记录在该仓库的 `last_error` 字段里，可以从 `GET /v1/onboarding/status` 查看。
+
 ## 快速开始
 
 项目使用 Python 3.11。先安装锁定范围内的运行依赖，并在同一个 PowerShell 窗口中配置本地管理员：

@@ -3,6 +3,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 const titles = {
   overview: "运行总览",
+  onboard: "接入向导",
   review: "发起审查",
   tasks: "任务中心",
   skills: "Skill 注册中心",
@@ -12,6 +13,7 @@ const titles = {
 
 const subtitles = {
   overview: "了解审查进展，快速开始下一次代码审查",
+  onboard: "三步完成配置，让新提交的 PR 自动得到审查",
   review: "提交代码变更，检查潜在问题并获取修复建议",
   tasks: "查找审查任务，查看问题详情与处理建议",
   skills: "了解每项审查能力的用途与当前配置",
@@ -127,6 +129,7 @@ function show(view, updateHash = true) {
   if (updateHash) history.replaceState(null, "", `#${view}`);
 
   if (view === "overview") loadDashboard();
+  if (view === "onboard") loadOnboarding();
   if (view === "tasks") loadTasks();
   if (view === "skills") loadSkills();
   if (view === "evolution") loadFailures();
@@ -1403,6 +1406,285 @@ function applyTheme(theme) {
   }
   document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#101216" : "#f6f7f9");
 }
+
+/* ---------- 接入向导 ---------- */
+let onboardingStatus = null;
+
+function onboardSetStep(step, status) {
+  const node = $(`.onboard-step[data-step="${step}"]`);
+  if (node) node.dataset.state = status;
+}
+
+function onboardBadge(selector, text, ok) {
+  const node = $(selector);
+  if (!node) return;
+  node.textContent = text;
+  node.className = `status ${ok ? "status-success" : "status-neutral"}`;
+}
+
+function renderOnboarding(status) {
+  onboardingStatus = status;
+  const llm = status.llm || {};
+  const github = status.github || {};
+  const webhook = status.webhook || {};
+
+  onboardBadge("#onboard-llm-badge", llm.configured ? `已配置 · ${llm.model || "模型"}` : "未配置", Boolean(llm.configured));
+  onboardSetStep("llm", llm.configured ? "done" : "active");
+
+  const form = $("#onboard-llm-form");
+  if (form) {
+    if (!form.elements.url.value) form.elements.url.value = llm.base_url || "";
+    if (!form.elements.model.value) form.elements.model.value = llm.model || "";
+    form.elements.api_key.placeholder = llm.api_key_masked || "sk-...";
+  }
+
+  onboardBadge(
+    "#onboard-github-badge",
+    github.has_token ? `已连接 · ${github.account || github.token_masked || "令牌"}` : "未连接",
+    Boolean(github.has_token),
+  );
+  onboardSetStep("github", github.has_token ? "done" : llm.configured ? "active" : "pending");
+
+  const repoPanelBadge = $("#onboard-repo-count");
+  if (!github.has_token && repoPanelBadge) repoPanelBadge.textContent = "尚未加载";
+
+  const webhookPanel = $("#onboard-webhook-panel");
+  if (webhookPanel) webhookPanel.classList.toggle("hidden", !webhook.available);
+  const webhookUrl = $("#onboard-webhook-url");
+  if (webhookUrl) webhookUrl.textContent = webhook.endpoint || "—";
+  onboardBadge(
+    "#onboard-webhook-badge",
+    webhook.has_secret ? "已生成密钥" : webhook.available ? "未配置" : "不可用",
+    Boolean(webhook.has_secret),
+  );
+
+  const pollHint = $("#onboard-poll-hint");
+  if (pollHint) {
+    const interval = Number(status.watch_interval_seconds || 180);
+    const minutes = Math.max(1, Math.round(interval / 60));
+    pollHint.textContent = `后台每 ${minutes} 分钟扫描一次已订阅仓库的新提交。`;
+  }
+}
+
+function renderRepoList(repositories, watches) {
+  const list = $("#onboard-repo-list");
+  const count = $("#onboard-repo-count");
+  if (!list) return;
+  if (!repositories.length) {
+    list.innerHTML = '<p class="muted">这个令牌下没有可访问的仓库。</p>';
+    if (count) count.textContent = "0 个仓库";
+    return;
+  }
+  if (count) count.textContent = `${repositories.length} 个仓库`;
+  const subscribed = new Map((watches || []).map((item) => [item.repository, item]));
+  list.innerHTML = repositories.map((repo) => {
+    const record = subscribed.get(repo.full_name);
+    const checked = record && Number(record.enabled) ? "checked" : "";
+    const tags = [repo.private ? "私有" : "公开", repo.archived ? "已归档" : ""]
+      .filter(Boolean).join(" · ");
+    return `<label class="onboard-repo"><input type="checkbox" value="${escapeHtml(repo.full_name)}" ${checked}><span><b>${escapeHtml(repo.full_name)}</b><small>${escapeHtml(tags)}</small></span></label>`;
+  }).join("");
+}
+
+async function loadOnboardRepositories(status) {
+  try {
+    const data = await api("/v1/onboarding/repositories?limit=100");
+    renderRepoList(data.repositories || [], (status && status.watches) || []);
+  } catch (error) {
+    const list = $("#onboard-repo-list");
+    if (list) list.innerHTML = `<p class="inline-error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function loadOnboarding() {
+  try {
+    const status = await api("/v1/onboarding/status");
+    renderOnboarding(status);
+    if (status.github && status.github.has_token) {
+      await loadOnboardRepositories(status);
+    } else {
+      const list = $("#onboard-repo-list");
+      if (list) list.innerHTML = '<p class="muted">连接 GitHub 后这里会列出仓库。</p>';
+    }
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function probeGithubCli() {
+  const box = $("#onboard-github-detected");
+  if (box) {
+    box.classList.remove("hidden");
+    box.textContent = "正在检测本机 GitHub CLI…";
+  }
+  try {
+    const report = await api("/v1/onboarding/probe-gh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!box) return;
+    if (!report.found) {
+      box.textContent = report.reason || "未检测到本机登录，请填写访问令牌。";
+      return;
+    }
+    const scopeNote = report.missing_repo_scope
+      ? "，但令牌缺少 repo 权限，请先执行 gh auth refresh -s repo"
+      : "";
+    box.innerHTML = `检测到 <b>${escapeHtml(report.account || "已登录账号")}</b>（${escapeHtml(report.token_masked)}）${escapeHtml(scopeNote)}。<button class="text-button" type="button" data-action="adopt">使用此身份</button>`;
+  } catch (error) {
+    if (box) box.textContent = error.message;
+  }
+}
+
+async function adoptGithubCli() {
+  const errorNode = $("#onboard-github-error");
+  if (errorNode) errorNode.textContent = "";
+  try {
+    const saved = await api("/v1/onboarding/github", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "gh-cli" }),
+    });
+    toast(`已连接 GitHub：${saved.account || "账号"}`);
+    await loadOnboarding();
+  } catch (error) {
+    if (errorNode) errorNode.textContent = error.message;
+  }
+}
+
+async function submitOnboardLlm(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const errorNode = $("#onboard-llm-error");
+  if (errorNode) errorNode.textContent = "";
+  setButtonBusy(button, true, "验证中…");
+  try {
+    const result = await api("/v1/onboarding/llm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: form.elements.url.value.trim(),
+        model: form.elements.model.value.trim(),
+        api_key: form.elements.api_key.value.trim(),
+      }),
+    });
+    form.elements.api_key.value = "";
+    toast(`模型已生效：${result.model}`);
+    await loadOnboarding();
+  } catch (error) {
+    if (errorNode) errorNode.textContent = error.message;
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function submitOnboardToken(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const errorNode = $("#onboard-github-error");
+  if (errorNode) errorNode.textContent = "";
+  const token = form.elements.token.value.trim();
+  if (!token) {
+    if (errorNode) errorNode.textContent = "请填写访问令牌，或先点击“重新检测本机登录”。";
+    return;
+  }
+  setButtonBusy(button, true, "连接中…");
+  try {
+    const saved = await api("/v1/onboarding/github", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, source: "manual" }),
+    });
+    form.elements.token.value = "";
+    toast(`已连接 GitHub：${saved.account || "账号"}`);
+    await loadOnboarding();
+  } catch (error) {
+    if (errorNode) errorNode.textContent = error.message;
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function saveOnboardWatches() {
+  const button = $("#onboard-save-repos");
+  const errorNode = $("#onboard-repos-error");
+  if (errorNode) errorNode.textContent = "";
+  const webhookReady = Boolean(onboardingStatus && onboardingStatus.webhook && onboardingStatus.webhook.available);
+  const mode = webhookReady ? "both" : "poll";
+  const enabled = $("#onboard-enable-poll") ? $("#onboard-enable-poll").checked : true;
+  const checked = $$("#onboard-repo-list input[type=checkbox]").filter((node) => node.checked);
+  const watches = checked.map((node) => ({ repository: node.value, mode, enabled }));
+  setButtonBusy(button, true, "保存中…");
+  try {
+    const result = await api("/v1/onboarding/watches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ watches }),
+    });
+    toast(`已保存 ${(result.watches || []).length} 个仓库`);
+    onboardSetStep("repos", (result.watches || []).length ? "done" : "active");
+    await loadOnboarding();
+  } catch (error) {
+    if (errorNode) errorNode.textContent = error.message;
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function generateWebhookSecret() {
+  const out = $("#onboard-webhook-secret-out");
+  try {
+    const result = await api("/v1/onboarding/webhook-secret", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (out) {
+      out.innerHTML = `Secret：<code>${escapeHtml(result.secret)}</code>（只显示这一次，请立即填入 GitHub）`;
+    }
+    toast("Secret 已生成");
+    await loadOnboarding();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function waitForWebhookEvent() {
+  const node = $("#onboard-webhook-status");
+  if (!node) return;
+  node.textContent = "正在等待 GitHub 推送事件，去目标仓库开一个 PR 试试…";
+  const started = Date.now();
+  const timer = setInterval(async () => {
+    if (Date.now() - started > 120000) {
+      clearInterval(timer);
+      node.textContent = "两分钟内没有收到事件。请检查 Payload URL、Secret 与事件类型是否正确。";
+      return;
+    }
+    try {
+      const data = await api("/v1/onboarding/webhook/await");
+      if (data.delivery) {
+        clearInterval(timer);
+        node.textContent = `已收到事件 ${data.delivery.delivery_id}（${formatTime(data.delivery.received_at)}）`;
+      }
+    } catch (error) {
+      clearInterval(timer);
+      node.textContent = error.message;
+    }
+  }, 5000);
+}
+
+$("#onboard-llm-form")?.addEventListener("submit", submitOnboardLlm);
+$("#onboard-token-form")?.addEventListener("submit", submitOnboardToken);
+$("#onboard-probe")?.addEventListener("click", probeGithubCli);
+$("#onboard-save-repos")?.addEventListener("click", saveOnboardWatches);
+$("#onboard-gen-secret")?.addEventListener("click", generateWebhookSecret);
+$("#onboard-wait-event")?.addEventListener("click", waitForWebhookEvent);
+$("#onboard-github-detected")?.addEventListener("click", (event) => {
+  if (event.target.closest('[data-action="adopt"]')) adoptGithubCli();
+});
 
 applyTheme(localStorage.getItem("pragent_theme") || "light");
 $("#theme-toggle")?.addEventListener("click", () => {

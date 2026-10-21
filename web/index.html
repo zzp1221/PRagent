@@ -28,6 +28,10 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.2" y="3.2" width="7.4" height="7.4" rx="2"/><rect x="13.4" y="3.2" width="7.4" height="7.4" rx="2"/><rect x="3.2" y="13.4" width="7.4" height="7.4" rx="2"/><rect x="13.4" y="13.4" width="7.4" height="7.4" rx="2"/></svg>
           <span>运行总览<small>查看整体运行情况</small></span>
         </button>
+        <button class="nav-item" data-view="onboard" type="button" title="接入向导：配置模型与仓库，开启自动审查">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.4"/><path d="M12 8.2v4.4l2.8 1.7"/></svg>
+          <span>接入向导<small>三步开启自动审查</small></span>
+        </button>
         <button class="nav-item" data-view="review" type="button" title="发起审查：提交代码变更，获取问题与建议">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6.5 4.2 12 9 17.5"/><path d="M15 6.5 19.8 12 15 17.5"/></svg>
           <span>发起审查<small>提交需要检查的代码</small></span>
@@ -115,6 +119,92 @@
           <div class="overview-links">
             <button class="overview-link" data-jump="evolution" type="button"><span>待处理反馈 <b id="overview-feedback">待加载</b></span><small>将反馈用于改进审查 <span aria-hidden="true">→</span></small></button>
             <button class="overview-link" data-jump="skills" type="button"><span>生效能力版本 <b id="overview-skills">待加载</b></span><small>了解当前检查能力 <span aria-hidden="true">→</span></small></button>
+          </div>
+        </section>
+
+        <section class="view" id="view-onboard" aria-labelledby="page-title">
+          <div class="onboard-steps" id="onboard-steps" aria-live="polite">
+            <div class="onboard-step" data-step="llm"><b>1</b><span><strong>配置模型</strong><small>填写地址、模型与密钥</small></span></div>
+            <div class="onboard-step" data-step="github"><b>2</b><span><strong>连接 GitHub</strong><small>识别身份，读取仓库</small></span></div>
+            <div class="onboard-step" data-step="repos"><b>3</b><span><strong>选择仓库</strong><small>开启自动审查</small></span></div>
+          </div>
+
+          <div class="onboard-grid">
+            <article class="panel" id="onboard-llm-panel">
+              <div class="panel-head">
+                <div><h2 class="panel-title">1. 配置模型</h2><p class="panel-description">填入任意兼容 OpenAI 接口的地址、模型名与密钥，保存后立即生效，无需重启。</p></div>
+                <span class="status status-neutral" id="onboard-llm-badge">未配置</span>
+              </div>
+              <form id="onboard-llm-form">
+                <label>接口地址
+                  <input name="url" placeholder="https://api.example.com/v1" autocomplete="off" required>
+                </label>
+                <div class="field-row">
+                  <label>模型名称
+                    <input name="model" placeholder="例如 deepseek-chat" autocomplete="off" required>
+                  </label>
+                  <label>API Key
+                    <input name="api_key" type="password" placeholder="sk-..." autocomplete="off" required>
+                  </label>
+                </div>
+                <div class="form-footer">
+                  <p class="muted" id="onboard-llm-hint">保存时会真实调用一次接口验证凭据。</p>
+                  <button class="button" type="submit">测试并保存</button>
+                </div>
+                <p class="inline-error" id="onboard-llm-error" role="alert"></p>
+              </form>
+            </article>
+
+            <article class="panel" id="onboard-github-panel">
+              <div class="panel-head">
+                <div><h2 class="panel-title">2. 连接 GitHub</h2><p class="panel-description">优先自动识别本机 GitHub CLI 登录；识别不到时手动填写访问令牌即可。</p></div>
+                <span class="status status-neutral" id="onboard-github-badge">未连接</span>
+              </div>
+              <div id="onboard-github-detected" class="onboard-note hidden"></div>
+              <form id="onboard-token-form">
+                <label>访问令牌
+                  <input name="token" type="password" placeholder="ghp_... 或 github_pat_..." autocomplete="off">
+                </label>
+                <p class="muted" id="onboard-token-hint">令牌需要 repo 权限。可在 GitHub 设置 → Developer settings → Personal access tokens 生成。</p>
+                <div class="form-footer">
+                  <button class="text-button" id="onboard-probe" type="button">重新检测本机登录</button>
+                  <button class="button" type="submit">连接 GitHub</button>
+                </div>
+                <p class="inline-error" id="onboard-github-error" role="alert"></p>
+              </form>
+            </article>
+
+            <article class="panel" id="onboard-repos-panel">
+              <div class="panel-head">
+                <div><h2 class="panel-title">3. 选择仓库</h2><p class="panel-description">勾选需要自动审查的仓库。开启后按固定间隔扫描新提交，审查结果会回到 PR 评论。</p></div>
+                <span class="muted" id="onboard-repo-count">尚未加载</span>
+              </div>
+              <div class="onboard-repo-list" id="onboard-repo-list"><p class="muted">连接 GitHub 后这里会列出仓库。</p></div>
+              <div class="form-footer">
+                <label class="check"><input id="onboard-enable-poll" type="checkbox" checked><span>开启后台自动扫描</span></label>
+                <button class="button" id="onboard-save-repos" type="button">保存订阅</button>
+              </div>
+              <p class="muted" id="onboard-poll-hint"></p>
+              <p class="inline-error" id="onboard-repos-error" role="alert"></p>
+            </article>
+
+            <article class="panel hidden" id="onboard-webhook-panel">
+              <div class="panel-head">
+                <div><h2 class="panel-title">可选：秒级响应</h2><p class="panel-description">当前地址可公网访问，可在仓库里配置 webhook 让 GitHub 主动推送事件，比轮询更快。</p></div>
+                <span class="status status-neutral" id="onboard-webhook-badge">未配置</span>
+              </div>
+              <ol class="onboard-webhook-steps">
+                <li>打开目标仓库的 Settings → Webhooks → Add webhook。</li>
+                <li>Payload URL 填 <code id="onboard-webhook-url">—</code>，Content type 选 <code>application/json</code>。</li>
+                <li>Secret 填下方生成的密钥，事件选择 Pull requests。</li>
+              </ol>
+              <div class="form-footer">
+                <button class="text-button" id="onboard-gen-secret" type="button">生成 Secret</button>
+                <button class="text-button" id="onboard-wait-event" type="button">等待首个事件</button>
+              </div>
+              <p class="muted" id="onboard-webhook-secret-out"></p>
+              <p class="muted" id="onboard-webhook-status"></p>
+            </article>
           </div>
         </section>
 

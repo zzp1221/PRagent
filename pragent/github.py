@@ -122,8 +122,50 @@ class GitHubClient:
                     raise RuntimeError("GitHub API request failed: %s" % exc) from exc
                 time.sleep(min(2 ** (attempt - 1) + random.random(), 10))
 
+    def get_authenticated_user(self) -> dict:
+        """Identify the account behind the current token."""
+        return self._json("GET", "https://api.github.com/user")
+
+    def list_repositories(self, limit: int = 100) -> list:
+        """Repositories the current token can actually read.
+
+        Only names are returned: the onboarding wizard needs an identifier to
+        subscribe to, and shipping the whole payload would leak unrelated data
+        into the browser.
+        """
+        per_page = max(1, min(int(limit), 100))
+        repositories = self._json(
+            "GET",
+            "https://api.github.com/user/repos?per_page=%d&sort=updated&affiliation=owner,collaborator,organization_member"
+            % per_page,
+        )
+        if not isinstance(repositories, list):
+            return []
+        return [
+            {
+                "full_name": str(item.get("full_name") or ""),
+                "private": bool(item.get("private")),
+                "archived": bool(item.get("archived")),
+                "default_branch": str(item.get("default_branch") or ""),
+            }
+            for item in repositories
+            if item.get("full_name")
+        ]
+
     def get_pull_request(self, repository: str, number: int) -> dict:
         return self._json("GET", "https://api.github.com/repos/%s/pulls/%d" % (repository, number))
+
+    def list_open_pull_requests(self, repository: str, limit: int = 30) -> list:
+        """Open pull requests sorted by most recent update, for the poller."""
+        per_page = max(1, min(int(limit), 100))
+        pulls = self._json(
+            "GET",
+            "https://api.github.com/repos/%s/pulls?state=open&per_page=%d&sort=updated&direction=desc"
+            % (repository, per_page),
+        )
+        if not isinstance(pulls, list):
+            return []
+        return pulls
 
     def get_file(self, repository: str, path: str, ref: str) -> dict:
         quoted = urllib.parse.quote(path, safe="/")

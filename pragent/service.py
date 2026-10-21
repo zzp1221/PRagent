@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import uuid
 from typing import Any, Dict, Optional
@@ -31,11 +32,24 @@ from .rollout import ReleaseManager
 from .verifier import RepairVerifier
 
 
+# Model credentials and webhook secrets belong to the deployment, not to a
+# tenant: one process holds exactly one model client and one GitHub identity.
+DEPLOYMENT_SCOPE = "__deployment__"
+
+# Runtime setting key holding the GitHub token the wizard saved. It lives here
+# rather than in onboarding.py because the service itself needs to resolve the
+# token when a queued task fetches its diff lazily.
+KEY_GITHUB_TOKEN = "github.token"
+
+# Sentinel for "use the client already installed on the service" so a caller can
+# still pass an explicit None when building the model-disabled variant.
+USE_CURRENT_CLIENT = object()
+
+
 class ReviewService:
     def __init__(self, settings: Settings):
         self.settings = settings
         settings.validate_evolution()
-        self.llm_config = settings.resolved_llm()
         self.store = create_store(settings.database_url, settings.db_path)
         self.memory = MemoryManager(
             self.store, settings.memory_enabled, settings.memory_recall_limit,
@@ -59,35 +73,12 @@ class ReviewService:
             "reliability-review", ReliabilityRuleReviewer(),
             "1.0.0", "Reliability and observability review",
         )
-        if self.llm_config:
-            active = self.store.get_active_skill_version("llm-review")
-            self.registry.register(
-                "llm-review",
-                self._build_llm_reviewer(active["prompt"] if active else ""),
-                "1.0.0", "Context-aware AI code review via %s" % self.llm_config["provider"],
-            )
-        self.registry.reload()
-        self.chat_client = (
-            JsonChatClient(
-                str(self.llm_config["base_url"]), str(self.llm_config["api_key"]),
-                str(self.llm_config["model"]), str(self.llm_config["provider"]),
-                settings.timeout_seconds, dict(self.llm_config.get("headers") or {}),
-                settings.llm_thinking, settings.llm_reasoning_effort,
-            ) if self.llm_config else None
-        )
-        self.reviewer = self._build_agentic_reviewer()
-        self.harness = ReviewHarness(
-            self.store, self.reviewer, settings.max_steps, settings.timeout_seconds,
-            observability=self.observability,
-        )
+        # Everything from here to the end of _install_llm_runtime depends on the
+        # model client, so the onboarding wizard must be able to assemble it
+        # again at runtime without restarting the process.
+        self.effective_settings = self._effective_settings()
+        self._install_llm_runtime(self.effective_settings)
         self.github = GitHubClient(settings.github_token)
-        repair_verifier = RepairVerifier(
-            settings.repair_test_command, settings.repair_verify_timeout_seconds
-        )
-        self.fixer = (
-            VerifiedPatchFixer(self.chat_client, repair_verifier)
-            if self.chat_client else SuggestionOnlyFixer()
-        )
         self.auth = AuthManager(
             self.store, settings.auth_secret, settings.session_ttl_seconds,
             settings.bootstrap_admin_username, settings.bootstrap_admin_password,
@@ -97,54 +88,139 @@ class ReviewService:
         self.alerts = AlertManager(
             self.store, settings.alert_failure_rate, settings.alert_min_samples
         )
-        self.evolution = EvolutionEngine(
-            self.store,
-            reviewer_factory=self._build_llm_reviewer if self.llm_config else None,
-            min_cases=settings.eval_min_cases,
-            max_cases=settings.eval_max_cases,
-            min_improvement=settings.eval_min_improvement,
-            min_holdout_cases=settings.eval_min_holdout_cases,
-            max_metric_regression=settings.eval_max_metric_regression,
-            candidate_generator=(
-                RootCauseEvolutionGenerator(self.chat_client)
-                if self.chat_client else None
-            ),
-        )
-        self.skill_evolution = SkillEvolutionEngine(
-            self.store,
-            reviewer_factory=(lambda artifact: AgentSkillReplayReviewer(
-                    artifact, self.chat_client,
-                    settings.agent_token_budget,
-                    settings.agent_time_budget_seconds,
-                )) if self.chat_client else None,
-            min_cases=settings.eval_min_cases,
-            max_cases=settings.eval_max_cases,
-            min_improvement=settings.eval_min_improvement,
-            min_holdout_cases=settings.eval_min_holdout_cases,
-            max_metric_regression=settings.eval_max_metric_regression,
-        )
         self.queue = TaskQueue(
             self._process_queued, settings.async_workers, settings.redis_url,
             settings.queue_max_attempts, settings.queue_lease_seconds,
             self._on_dead_letter,
         )
 
-    def _build_llm_reviewer(self, prompt: str = "") -> OpenAICompatibleReviewer:
-        if not self.llm_config:
-            raise RuntimeError("no LLM provider is configured")
-        return OpenAICompatibleReviewer(
-            str(self.llm_config["base_url"]),
-            str(self.llm_config["api_key"]),
-            str(self.llm_config["model"]),
-            self.settings.timeout_seconds,
-            system_prompt=prompt,
-            provider=str(self.llm_config["provider"]),
-            extra_headers=dict(self.llm_config.get("headers") or {}),
+    def _effective_settings(self) -> Settings:
+        """Environment settings with the wizard's persisted overrides applied.
+
+        Wizard values always describe a custom OpenAI-compatible endpoint, which
+        is exactly the provider, model and key triple the user typed. When any
+        of them is missing the environment configuration wins unchanged.
+        """
+        overrides = self.store.list_runtime_settings(DEPLOYMENT_SCOPE)
+        base_url = (overrides.get("llm.base_url") or "").strip().rstrip("/")
+        model = (overrides.get("llm.model") or "").strip()
+        api_key = (overrides.get("llm.api_key") or "").strip()
+        if not (base_url and model and api_key):
+            return self.settings
+        return dataclasses.replace(
+            self.settings,
+            llm_provider="custom",
+            llm_base_url=base_url,
+            llm_model=model,
+            llm_api_key=api_key,
         )
 
-    def _build_agentic_reviewer(self) -> AgenticReviewer:
+    def _llm_reviewer(
+        self, llm_config: Dict[str, Any], effective: Settings, prompt: str = "",
+    ) -> OpenAICompatibleReviewer:
+        if not llm_config:
+            raise RuntimeError("no LLM provider is configured")
+        return OpenAICompatibleReviewer(
+            str(llm_config["base_url"]),
+            str(llm_config["api_key"]),
+            str(llm_config["model"]),
+            effective.timeout_seconds,
+            system_prompt=prompt,
+            provider=str(llm_config["provider"]),
+            extra_headers=dict(llm_config.get("headers") or {}),
+        )
+
+    def _install_llm_runtime(self, effective: Settings) -> None:
+        """Assemble every model-dependent component from one settings snapshot.
+
+        New objects are fully built before any attribute is published so a
+        failure part way through cannot leave the service holding a client from
+        one configuration and a reviewer from another.
+        """
+        llm_config = effective.resolved_llm()
+        chat_client = (
+            JsonChatClient(
+                str(llm_config["base_url"]), str(llm_config["api_key"]),
+                str(llm_config["model"]), str(llm_config["provider"]),
+                effective.timeout_seconds, dict(llm_config.get("headers") or {}),
+                effective.llm_thinking, effective.llm_reasoning_effort,
+            ) if llm_config else None
+        )
+        if llm_config:
+            active = self.store.get_active_skill_version("llm-review")
+            self.registry.register(
+                "llm-review",
+                self._llm_reviewer(llm_config, effective, active["prompt"] if active else ""),
+                "1.0.0", "Context-aware AI code review via %s" % llm_config["provider"],
+            )
+        self.registry.reload()
+        reviewer = self._build_agentic_reviewer(chat_client, effective)
+        harness = ReviewHarness(
+            self.store, reviewer, effective.max_steps, effective.timeout_seconds,
+            observability=self.observability,
+        )
+        fixer = (
+            VerifiedPatchFixer(chat_client, RepairVerifier(
+                effective.repair_test_command, effective.repair_verify_timeout_seconds,
+            )) if chat_client else SuggestionOnlyFixer()
+        )
+        evolution = EvolutionEngine(
+            self.store,
+            reviewer_factory=(
+                (lambda prompt="": self._llm_reviewer(llm_config, effective, prompt))
+                if llm_config else None
+            ),
+            min_cases=effective.eval_min_cases,
+            max_cases=effective.eval_max_cases,
+            min_improvement=effective.eval_min_improvement,
+            min_holdout_cases=effective.eval_min_holdout_cases,
+            max_metric_regression=effective.eval_max_metric_regression,
+            candidate_generator=(
+                RootCauseEvolutionGenerator(chat_client) if chat_client else None
+            ),
+        )
+        skill_evolution = SkillEvolutionEngine(
+            self.store,
+            reviewer_factory=(lambda artifact: AgentSkillReplayReviewer(
+                    artifact, chat_client,
+                    effective.agent_token_budget,
+                    effective.agent_time_budget_seconds,
+                )) if chat_client else None,
+            min_cases=effective.eval_min_cases,
+            max_cases=effective.eval_max_cases,
+            min_improvement=effective.eval_min_improvement,
+            min_holdout_cases=effective.eval_min_holdout_cases,
+            max_metric_regression=effective.eval_max_metric_regression,
+        )
+        # Publish only after every object exists.
+        self.effective_settings = effective
+        self.llm_config = llm_config
+        self.chat_client = chat_client
+        self.reviewer = reviewer
+        self.harness = harness
+        self.fixer = fixer
+        self.evolution = evolution
+        self.skill_evolution = skill_evolution
+
+    def reload_llm(self) -> Dict[str, Any]:
+        """Re-apply the persisted model settings without restarting the process."""
+        effective = self._effective_settings()
+        self._install_llm_runtime(effective)
+        config = self.llm_config or {}
+        return {
+            "configured": bool(config),
+            "provider": config.get("provider", ""),
+            "model": config.get("model", ""),
+            "base_url": config.get("base_url", ""),
+        }
+
+    def _build_agentic_reviewer(
+        self, chat_client=USE_CURRENT_CLIENT, settings: Optional[Settings] = None,
+    ) -> AgenticReviewer:
+        active = settings or self.effective_settings
+        client = self.chat_client if chat_client is USE_CURRENT_CLIENT else chat_client
         enabled = {
-            item.strip() for item in self.settings.enabled_agents.split(",") if item.strip()
+            item.strip() for item in active.enabled_agents.split(",") if item.strip()
         }
         unknown = enabled.difference({
             "lead", "security", "correctness-reliability", "critic"
@@ -164,25 +240,25 @@ class ReviewService:
                     run["metrics"]["structured_candidate"].get("candidate") or {}
                 )
         return AgenticReviewer(
-            self.store, self.chat_client,
-            self.settings.agent_token_budget,
-            self.settings.agent_time_budget_seconds,
-            self.settings.llm_input_cost_per_million,
-            self.settings.llm_output_cost_per_million,
+            self.store, client,
+            active.agent_token_budget,
+            active.agent_time_budget_seconds,
+            active.llm_input_cost_per_million,
+            active.llm_output_cost_per_million,
             enabled,
             [
                 item for item in self.registry.reviewers()
                 if not isinstance(item, OpenAICompatibleReviewer)
             ],
             None,
-            self.settings.repair_test_command,
+            active.repair_test_command,
             active_prompt["prompt"] if active_prompt else "",
             structured_config,
             self.memory,
             self.context_manager,
             self._active_agent_skills,
-            self.settings.agent_max_output_tokens,
-            **self.settings.resolved_review_budget(),
+            active.agent_max_output_tokens,
+            **active.resolved_review_budget(),
         )
 
     def _run_review(
@@ -194,21 +270,8 @@ class ReviewService:
         )
 
     def reload_skills(self) -> list:
-        if self.llm_config:
-            active = self.store.get_active_skill_version("llm-review")
-            self.registry.register(
-                "llm-review",
-                self._build_llm_reviewer(active["prompt"] if active else ""),
-                "1.0.0", "Context-aware AI code review via %s" % self.llm_config["provider"],
-            )
-        self.registry.reload()
-        skills = self.registry.list()
-        self.reviewer = self._build_agentic_reviewer()
-        self.harness = ReviewHarness(
-            self.store, self.reviewer, self.settings.max_steps, self.settings.timeout_seconds,
-            observability=self.observability,
-        )
-        return skills
+        self._install_llm_runtime(self._effective_settings())
+        return self.registry.list()
 
     def _active_agent_skills(self, tenant_id: str) -> list:
         values = {skill.name: skill for skill in self.registry.agent_skills()}
@@ -269,20 +332,67 @@ class ReviewService:
         self, delivery_id: str, repository: str, pull_request: Optional[int],
         tenant_id: str, payload: Dict[str, Any],
     ) -> str:
-        """Create the task and mark the delivery handled in one transaction."""
+        """Create the task and mark the delivery handled in one transaction.
+
+        Returns an empty string when the poller already claimed this commit, so
+        the caller can report a duplicate instead of reviewing it twice.
+        """
+        head_sha = str(payload.get("head_sha") or "")
         task_id = str(uuid.uuid4())
+        if not self.store.claim_review_commit(tenant_id, repository, head_sha, task_id):
+            self.store.complete_webhook(delivery_id, None)
+            return ""
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
-        self.store.create_webhook_task(
-            delivery_id, task_id, repository, pull_request,
-            {
-                "source": "github-webhook", "diff_pending": True,
-                "release_lane": assignment["lane"], "shadow": assignment["shadow"],
-                **payload,
-                "mode": RunMode.AGENTIC.value,
-            },
-            tenant_id,
-        )
+        try:
+            self.store.create_webhook_task(
+                delivery_id, task_id, repository, pull_request,
+                {
+                    "source": "github-webhook", "diff_pending": True,
+                    "release_lane": assignment["lane"], "shadow": assignment["shadow"],
+                    **payload,
+                    "mode": RunMode.AGENTIC.value,
+                },
+                tenant_id,
+            )
+        except Exception:
+            # Without the task the claim would block this commit forever.
+            self.store.release_review_commit(tenant_id, repository, head_sha)
+            raise
         return task_id
+
+    def submit_polled_review(
+        self, tenant_id: str, repository: str, pull_request: int,
+        head_sha: str, diff_url: str, issue_url: str = "",
+    ) -> Dict[str, Any]:
+        """Queue a review the poller discovered instead of a webhook delivery.
+
+        The commit ledger is claimed before the task is created, which is what
+        makes polling and webhooks agree on "already reviewed".
+        """
+        self._require_agentic_model()
+        self._authorize_repository(tenant_id, repository)
+        task_id = str(uuid.uuid4())
+        if not self.store.claim_review_commit(tenant_id, repository, head_sha, task_id):
+            existing = self.store.find_review_commit(tenant_id, repository, head_sha) or {}
+            return {"duplicate": True, "task_id": str(existing.get("task_id") or "")}
+        assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
+        try:
+            self.store.create(task_id, repository, pull_request, {
+                "source": "github-poll", "diff_pending": True, "diff_url": diff_url,
+                "github_issue_url": issue_url, "head_sha": head_sha,
+                "release_lane": assignment["lane"], "shadow": assignment["shadow"],
+                "mode": RunMode.AGENTIC.value,
+            }, tenant_id)
+        except Exception:
+            self.store.release_review_commit(tenant_id, repository, head_sha)
+            raise
+        self.queue.submit({
+            "task_id": task_id, "repository": repository, "pull_request": pull_request,
+            "github_issue_url": issue_url, "tenant_id": tenant_id, "diff_url": diff_url,
+        }, message_id=task_id)
+        self.store.update_task_input(task_id, {"dispatched_at": utc_now()})
+        metrics.inc("reviews_enqueued_total")
+        return {"task_id": task_id, "state": "PENDING", "queue": self.queue.backend}
 
     def create_review(
         self, repository: str, diff: str, pull_request: Optional[int] = None,
@@ -387,7 +497,7 @@ class ReviewService:
         if diff is None and payload.get("diff_url"):
             client = (
                 self.github_client_for_installation(payload.get("installation_id"))
-                if payload.get("installation_id") else self.github
+                if payload.get("installation_id") else self.runtime_github_client()
             )
             client.ensure_repository_access(payload["repository"])
             diff = client.fetch_diff(payload["diff_url"])
@@ -542,6 +652,12 @@ class ReviewService:
                 "base_sha": (pull.get("base") or {}).get("sha", ""),
             },
         )
+        if not task_id:
+            metrics.inc("webhook_dedup_commit_total")
+            return {
+                "duplicate": True, "reason": "commit already reviewed",
+                "head_sha": str((pull.get("head") or {}).get("sha", "")),
+            }
         self.queue.submit({
             "task_id": task_id, "repository": repository, "pull_request": number,
             "github_issue_url": pull.get("issue_url", ""),
@@ -554,9 +670,23 @@ class ReviewService:
         result["will_post_to_github"] = self.settings.auto_post_review
         return result
 
+    def github_token(self) -> str:
+        """Token the wizard saved, falling back to the environment value."""
+        stored = self.store.get_runtime_setting(DEPLOYMENT_SCOPE, KEY_GITHUB_TOKEN)
+        return stored or self.settings.github_token
+
+    def runtime_github_client(self) -> GitHubClient:
+        """Client built from the token that is in force right now.
+
+        The long-lived self.github client is built once from environment values;
+        after the wizard stores a token, every later call must use that one
+        instead or lazy diff fetching would authenticate with the wrong identity.
+        """
+        return GitHubClient(self.github_token())
+
     def github_client_for_installation(self, installation_id: Optional[int] = None) -> GitHubClient:
         if installation_id is None:
-            return self.github
+            return self.runtime_github_client()
         if not self.settings.github_app_id or not self.settings.github_private_key_path:
             raise ValueError("GitHub App credentials are not configured")
         token = GitHubAppAuthenticator(
