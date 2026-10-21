@@ -9,6 +9,14 @@ const titles = {
   evolution: "演进实验室",
 };
 
+const subtitles = {
+  overview: "了解审查进展，快速开始下一次代码审查",
+  review: "提交代码变更，检查潜在问题并获取修复建议",
+  tasks: "查找审查任务，查看问题详情与处理建议",
+  skills: "了解每项审查能力的用途与当前配置",
+  evolution: "根据审查反馈评测改进方案，查看版本效果",
+};
+
 const stateLabels = {
   PENDING: "等待中",
   PLANNING: "规划中",
@@ -19,8 +27,15 @@ const stateLabels = {
   CANCELLED: "已取消",
 };
 
+const severityLabels = { critical: "严重", high: "高危", medium: "中危", low: "低危", info: "提示" };
+const riskLabels = { none: "无", low: "低", medium: "中", high: "高", critical: "严重", unknown: "未知" };
+
 let selectedTask = null;
 let selectedTaskData = null;
+let taskCache = [];
+let tasksRequest = 0;
+let taskDetailRequest = 0;
+let modelAvailable = null;
 let accessToken = localStorage.getItem("pragent_token") || "";
 let toastTimer = null;
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -45,6 +60,11 @@ function formatJson(value) {
   return JSON.stringify(value, null, 2);
 }
 
+function formatCount(value) {
+  const number = Number(value || 0);
+  return number >= 1000 ? `${(number / 1000).toFixed(1)}k` : String(number);
+}
+
 async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
@@ -66,12 +86,12 @@ async function api(path, options = {}) {
   return data;
 }
 
-function toast(message) {
+function toast(message, duration = 2600) {
   const element = $("#toast");
   element.textContent = message;
   element.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => element.classList.remove("show"), 2600);
+  toastTimer = setTimeout(() => element.classList.remove("show"), duration);
 }
 
 function setButtonBusy(button, busy, busyText) {
@@ -100,9 +120,11 @@ function show(view, updateHash = true) {
   });
   $(`#view-${view}`).classList.add("active");
   $("#page-title").textContent = titles[view];
+  $("#page-sub").textContent = subtitles[view] || "";
   document.title = `${titles[view]} · PRAgent`;
   if (updateHash) history.replaceState(null, "", `#${view}`);
 
+  if (view === "overview") loadDashboard();
   if (view === "tasks") loadTasks();
   if (view === "skills") loadSkills();
   if (view === "evolution") loadFailures();
@@ -113,16 +135,26 @@ $$(".nav-item").forEach((button) => button.addEventListener("click", () => show(
 $$("[data-jump]").forEach((button) => button.addEventListener("click", () => show(button.dataset.jump)));
 window.addEventListener("hashchange", () => show(location.hash.slice(1), false));
 
+function syncSelection() {
+  if (!selectedTask) return;
+  $$(".task-row[data-task]").forEach((row) => {
+    const selected = row.dataset.task === selectedTask;
+    row.classList.toggle("is-selected", selected);
+    row.setAttribute("aria-pressed", String(selected));
+  });
+}
+
 function taskRows(tasks) {
   if (!tasks?.length) {
-    return '<div class="empty-state"><span><b>还没有审查任务</b>提交一个 Diff 开始首次审查</span></div>';
+    return '<div class="empty-state"><span><b>还没有审查任务</b>提交一个 diff 开始首次审查。</span></div>';
   }
   return tasks.map((task) => {
     const state = String(task.state || "PENDING").toUpperCase();
     const repository = escapeHtml(task.repository || "未命名仓库");
     const pr = task.pull_request ? `PR #${escapeHtml(task.pull_request)}` : "手动审查";
+    const selected = selectedTask && task.id === selectedTask ? " is-selected" : "";
     return `
-      <button class="task-row" data-task="${escapeHtml(task.id)}" type="button">
+      <button class="task-row${selected}" data-task="${escapeHtml(task.id)}" type="button">
         <span class="task-main">
           <span class="task-glyph">PR</span>
           <span class="task-copy">
@@ -137,6 +169,7 @@ function taskRows(tasks) {
 
 function bindTasks(root) {
   $$("[data-task]", root).forEach((row) => row.addEventListener("click", () => openTask(row.dataset.task)));
+  syncSelection();
 }
 
 function statCard(label, value, note, style, icon) {
@@ -149,6 +182,7 @@ function statCard(label, value, note, style, icon) {
 function renderLlmRuntime(llm = {}, runMode = {}) {
   const enabled = Boolean(llm.enabled);
   const failed = Boolean(llm.error);
+  modelAvailable = failed ? null : enabled;
   const provider = String(llm.provider || "local");
   const model = String(llm.model || "");
   const detail = failed
@@ -165,9 +199,9 @@ function renderLlmRuntime(llm = {}, runMode = {}) {
 
   const chain = $("#execution-chain");
   if (chain) {
-    const scanner = '<div class="agent-step"><b>01</b><span><strong>Tool / Scanner</strong><small>规则、AST 与代码搜索提供事实</small></span><em>事实</em></div>';
-    const gate = '<i class="flow-line"></i><div class="agent-step"><b>03</b><span><strong>Gate</strong><small>格式、证据、置信度与发布门禁</small></span><em class="done">门禁</em></div>';
-    const llmStep = `<i class="flow-line"></i><div class="agent-step is-active" id="llm-agent-step"><b>02</b><span><strong>4-role LLM Agents</strong><small id="llm-agent-detail">${escapeHtml(detail)}</small></span><em id="llm-agent-state">${escapeHtml(state)}</em></div>`;
+    const scanner = '<div class="agent-step"><b>01</b><span><strong>收集代码信息</strong><small>扫描规则、代码结构与相关上下文</small></span><em class="done">扫描</em></div>';
+    const gate = '<i class="flow-line"></i><div class="agent-step"><b>03</b><span><strong>验证审查结论</strong><small>校验证据、置信度与发布条件</small></span><em class="done">验证</em></div>';
+    const llmStep = `<i class="flow-line"></i><div class="agent-step is-active" id="llm-agent-step"><b>02</b><span><strong>多角色协作审查</strong><small id="llm-agent-detail">${escapeHtml(detail)}</small></span><em id="llm-agent-state">${escapeHtml(state)}</em></div>`;
     chain.innerHTML = scanner + llmStep + gate;
   }
 
@@ -192,6 +226,11 @@ function renderLlmRuntime(llm = {}, runMode = {}) {
   capability.classList.toggle("is-error", failed);
   $("#llm-capability-detail").textContent = detail;
   $("#llm-runtime-model").textContent = runtime;
+  const badge = $("#runtime-badge");
+  if (badge) {
+    badge.className = `status ${failed ? "state-failed" : enabled ? "status-online" : "state-pending"}`;
+    badge.textContent = failed ? "模型状态未知" : enabled ? "模型已就绪" : "需要配置模型";
+  }
 }
 
 async function loadDashboard() {
@@ -203,51 +242,402 @@ async function loadDashboard() {
       modeSelect.value = "agentic";
       modeSelect.disabled = !data.llm?.enabled;
     }
-    $("#system-status").textContent = `${data.queue} · ${data.orchestrator}`;
+    $("#system-status").textContent = "服务已连接";
+    $("#system-status").dataset.connected = "true";
+    $("#system-status").title = `${data.queue} · ${data.orchestrator}`;
     const stats = data.stats || {};
     const rate = Math.round(Number(stats.success_rate || 0) * 100);
     $("#stats").innerHTML = [
       statCard("总任务", stats.tasks_total ?? 0, "累计审查任务", "", "ALL"),
-      statCard("已完成", stats.tasks_success ?? 0, "通过质量门禁", "success", "OK"),
+      statCard("已完成", stats.tasks_success ?? 0, "已生成审查报告", "success", "OK"),
       statCard("失败", stats.tasks_failed ?? 0, "需要进一步处理", "failed", "ERR"),
       statCard("成功率", `${rate}%`, "全部任务成功率", "rate", "RATE"),
-      statCard("待处理案例", stats.unresolved_failure_cases ?? 0, "未解决反馈", "feedback", "OPEN"),
-      statCard("活跃 Skills", stats.active_skill_versions ?? 0, "当前生效版本", "skills", "SK"),
     ].join("");
+    if ($("#overview-feedback")) $("#overview-feedback").textContent = stats.unresolved_failure_cases ?? 0;
+    if ($("#overview-skills")) $("#overview-skills").textContent = stats.active_skill_versions ?? 0;
     $("#recent-tasks").innerHTML = taskRows((data.tasks || []).slice(0, 5));
     bindTasks($("#recent-tasks"));
   } catch (error) {
     renderLlmRuntime({ error: true }, {});
     $("#system-status").textContent = "服务连接异常";
-    $("#stats").innerHTML = '<div class="empty-state"><span><b>暂时无法读取数据</b>请检查服务状态后重试</span></div>';
+    $("#system-status").dataset.connected = "false";
+    $("#system-status").title = error.message;
+    if ($("#overview-feedback")) $("#overview-feedback").textContent = "待连接";
+    if ($("#overview-skills")) $("#overview-skills").textContent = "待连接";
+    $("#stats").innerHTML = '<div class="empty-state"><span><b>暂时无法读取数据</b>请检查服务状态后重试。</span></div>';
     $("#recent-tasks").innerHTML = '<div class="empty-state"><span>数据加载失败</span></div>';
     toast(error.message);
   }
 }
 
-async function loadTasks() {
+function renderTaskList() {
   const root = $("#all-tasks");
-  root.innerHTML = '<div class="list-loading"></div><div class="list-loading"></div>';
+  const query = ($("#task-search")?.value || "").trim().toLowerCase();
+  const filter = $("#task-filter")?.value || "all";
+  const tasks = taskCache.filter((task) => {
+    const state = String(task.state || "PENDING").toUpperCase();
+    const matchesState = filter === "all" || (filter === "active" ? ACTIVE_STATES.has(state) : state === filter);
+    const text = [task.repository, task.pull_request, task.id].filter((value) => value != null).join(" ").toLowerCase();
+    return matchesState && (!query || text.includes(query));
+  });
+  if ($("#task-count")) $("#task-count").textContent = query || filter !== "all" ? `${tasks.length} / ${taskCache.length} 项` : `${taskCache.length} 项`;
+  root.innerHTML = !tasks.length && taskCache.length
+    ? '<div class="empty-state"><span><b>没有匹配的任务</b>试试其他仓库、PR 编号或任务状态。</span></div>'
+    : taskRows(tasks);
+  bindTasks(root);
+}
+
+$("#task-search")?.addEventListener("input", renderTaskList);
+$("#task-filter")?.addEventListener("change", renderTaskList);
+$("#task-back")?.addEventListener("click", () => {
+  $("#view-tasks").classList.remove("is-detail");
+  $("#task-search")?.focus();
+  window.scrollTo({ top: 0, behavior: reduceMotion.matches ? "auto" : "smooth" });
+});
+
+async function loadTasks() {
+  const request = ++tasksRequest;
+  const root = $("#all-tasks");
+  if (!taskCache.length) root.innerHTML = '<div class="list-loading"></div><div class="list-loading"></div>';
   try {
     const data = await api("/api/tasks");
-    root.innerHTML = taskRows(data.tasks || []);
-    bindTasks(root);
+    if (request !== tasksRequest) return;
+    taskCache = data.tasks || [];
+    renderTaskList();
   } catch (error) {
+    if (request !== tasksRequest) return;
     root.innerHTML = '<div class="empty-state"><span>任务加载失败</span></div>';
+    if ($("#task-count")) $("#task-count").textContent = "加载失败";
     toast(error.message);
   }
 }
 
+const severityOrder = ["critical", "high", "medium", "low", "info"];
+
+const stopReasonLabels = {
+  "single-pass": "单步完成",
+  "high-risk-single-pass": "高风险单轮",
+  "high-risk-one-revision-round": "高风险一轮返工",
+};
+
+function renderGateFacts(gate) {
+  if (!gate || typeof gate !== "object") return "";
+  const unverified = Number(gate.unverified_evidence_count || 0);
+  const reasons = Array.isArray(gate.reasons) ? gate.reasons : [];
+  const verdict = gate.passed === false
+    ? `<span class="is-alert">门禁结论 <b>${reasons.length ? `${reasons.length} 项拦截` : "未通过"}</b></span>`
+    : `<span>门禁结论 <b>通过</b></span>`;
+  return `<div class="gate-facts">
+    <span>位置证据 <b>${gate.exact_location_evidence ? "命中" : "未命中"}</b></span>
+    <span>强证据 <b>${Number(gate.strong_evidence_count || 0)}</b></span>
+    <span>已验证引用 <b>${Number(gate.verified_evidence_count || 0)}</b></span>
+    <span class="${unverified > 0 ? "is-alert" : ""}">未验证引用 <b>${unverified}</b></span>
+    ${verdict}
+  </div>`;
+}
+
+function findingCard(item, index) {
+  const severity = String(item.severity || "medium").toLowerCase();
+  const location = `${item.path || "未知文件"}:${item.line ?? "?"}`;
+  const evidence = String(item.evidence || "").trim();
+  const refs = (item.evidence_refs || [])
+    .map((ref) => ref?.evidence_id)
+    .filter(Boolean);
+  const reasons = (item.gate && item.gate.reasons) || [];
+  const blocks = [
+    renderGateFacts(item.gate),
+    evidence ? `<pre>${escapeHtml(evidence)}</pre>` : "",
+    item.fix ? `<p><b>建议修复</b> ${escapeHtml(item.fix)}</p>` : "",
+    item.test ? `<p><b>建议测试</b> ${escapeHtml(item.test)}</p>` : "",
+    refs.length ? `<p><b>证据引用</b> ${escapeHtml(refs.join(", "))}</p>` : "",
+    reasons.length ? `<p><b>门禁提示</b> ${escapeHtml(reasons.join("；"))}</p>` : "",
+  ].filter(Boolean).join("");
+
+  return `<article class="finding sev-${escapeHtml(severity)}">
+    <div class="finding-head">
+      <span class="sev-tag">${escapeHtml(severityLabels[severity] || severity)}</span>
+      <span class="finding-loc">${escapeHtml(location)}</span>
+      ${item.rule_id ? `<span class="finding-rule">${escapeHtml(item.rule_id)}</span>` : ""}
+    </div>
+    <h4 class="finding-title">${escapeHtml(item.title || `发现 ${index + 1}`)}</h4>
+    ${item.explanation ? `<p class="finding-body">${escapeHtml(item.explanation)}</p>` : ""}
+    ${blocks ? `<details class="finding-more"><summary>证据与修复建议</summary>${blocks}</details>` : ""}
+  </article>`;
+}
+
+function renderFindings(findings) {
+  if (!findings.length) {
+    return '<div class="empty-state"><span><b>未发现需要处理的问题</b>新增代码行通过了当前质量门禁。</span></div>';
+  }
+  const groups = new Map();
+  findings.forEach((item, index) => {
+    const severity = String(item.severity || "medium").toLowerCase();
+    if (!groups.has(severity)) groups.set(severity, []);
+    groups.get(severity).push({ item, index });
+  });
+  const ordered = [
+    ...severityOrder.filter((severity) => groups.has(severity)),
+    ...[...groups.keys()].filter((severity) => !severityOrder.includes(severity)),
+  ];
+  return ordered.map((severity) => `
+    <div class="sev-group sev-${escapeHtml(severity)}">
+      <div class="sev-group-head">
+        <i></i><span>${escapeHtml(severityLabels[severity] || severity)}</span>
+        <span class="sev-count">${groups.get(severity).length}</span>
+      </div>
+      ${groups.get(severity).map((entry) => findingCard(entry.item, entry.index)).join("")}
+    </div>`).join("");
+}
+
+function renderBudget(budget) {
+  if (!budget || typeof budget !== "object") return "";
+  const tokenTotal = Number(budget.token_budget || 0);
+  const tokensUsed = Number(budget.tokens_used || 0);
+  const timeTotal = Number(budget.time_budget_seconds || 0);
+  const elapsed = Number(budget.elapsed_seconds || 0);
+  const callsTotal = Number(budget.max_model_calls || 0);
+  const callsUsed = Number(budget.model_calls || 0);
+  const exhausted = String(budget.exhausted || "").trim();
+
+  const row = (label, used, total, format) => {
+    if (!total && !used) return "";
+    const pct = total > 0 ? Math.min(100, (used / total) * 100) : 0;
+    const tone = total > 0 && pct >= 100 ? " is-full" : pct >= 75 ? " is-hot" : "";
+    const text = total > 0 ? `${format(used)} / ${format(total)}` : `${format(used)} / 未设上限`;
+    return `<div class="budget-row${tone}">
+      <span>${label}</span>
+      <div class="budget-track"><div class="budget-fill" style="width:${pct.toFixed(1)}%"></div></div>
+      <span class="budget-meta">${text}</span>
+    </div>`;
+  };
+
+  return `<div class="budget${exhausted ? " is-exhausted" : ""}">
+    <div class="budget-head">
+      <span>审查预算</span>
+      ${exhausted
+        ? `<span class="budget-alert">已耗尽 · ${escapeHtml(exhausted)}</span>`
+        : '<span>未超预算</span>'}
+    </div>
+    ${row("Tokens", tokensUsed, tokenTotal, (value) => formatCount(value))}
+    ${row("耗时", elapsed, timeTotal, (value) => `${Number(value).toFixed(1)}s`)}
+    ${row("模型调用", callsUsed, callsTotal, (value) => String(Math.round(value)))}
+  </div>`;
+}
+
+function renderGateSummary(gates, rejected) {
+  if (!gates || !Object.keys(gates).length) return "";
+  const cells = [
+    ["格式门禁", gates.format?.rejected],
+    ["证据门禁", gates.evidence?.rejected],
+    ["置信度门禁", gates.confidence?.rejected],
+    ["发布门禁", gates.release?.rejected],
+  ];
+  const cellHtml = cells.map(([label, count]) => {
+    const value = Number(count || 0);
+    return `<div class="gate-cell ${value > 0 ? "has-reject" : "is-clean"}">
+      <small>${label}</small><b>${value} 拦截</b>
+    </div>`;
+  }).join("");
+
+  const unverifiedRefs = Number(gates.evidence?.unverified_refs || 0);
+  const minimum = gates.confidence?.minimum;
+  const rejectedHtml = rejected.length ? `
+    <div class="rejected-list">
+      ${rejected.slice(0, 5).map((item) => `
+        <div class="rejected-item">
+          <div class="rejected-head">
+            <b>${escapeHtml(item.rule_id || "未命名规则")}</b>
+            <span>${escapeHtml(`${item.path || "未知文件"}:${item.line ?? "?"}`)}</span>
+          </div>
+          <ul>${(item.reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>
+        </div>`).join("")}
+      ${rejected.length > 5 ? `<p class="feedback-empty">另有 ${rejected.length - 5} 条被拦截的结论未显示。</p>` : ""}
+    </div>` : "";
+
+  return `<div class="gate-panel">
+    <div class="sev-group-head">
+      <i style="background:var(--accent)"></i><span>质量门禁</span>
+      <span class="sev-count">放行 ${Number(gates.accepted || 0)} · 拦截 ${Number(gates.rejected || 0)}</span>
+    </div>
+    <div class="gate-grid">${cellHtml}</div>
+    <div class="gate-foot">
+      ${minimum !== undefined ? `<span>置信度门槛 <b>${Number(minimum).toFixed(2)}</b></span>` : ""}
+      <span>未验证证据引用 <b>${unverifiedRefs}</b></span>
+    </div>
+    ${rejectedHtml}
+  </div>`;
+}
+
+function summarizeMessage(content) {
+  if (content == null) return "";
+  if (typeof content === "string") return content.slice(0, 220);
+  if (typeof content !== "object") return String(content);
+  for (const key of ["note", "reason", "summary", "message", "decision", "status"]) {
+    if (content[key]) return String(content[key]).slice(0, 220);
+  }
+  const keys = Object.keys(content);
+  if (!keys.length) return "";
+  return keys.slice(0, 4).map((key) => {
+    const value = content[key];
+    return `${key}=${typeof value === "object" ? "…" : String(value)}`;
+  }).join(" · ").slice(0, 220);
+}
+
+function renderCollaboration(task) {
+  const report = task?.report || {};
+  const collab = report.collaboration || {};
+  const trace = Array.isArray(task.trace) ? task.trace : [];
+  const messages = Array.isArray(task.collaboration) ? task.collaboration : [];
+  const roles = Array.isArray(collab.roles) ? collab.roles : [];
+  if (!trace.length && !messages.length && !roles.length) return "";
+
+  const items = [
+    ...trace.map((item) => ({
+      at: item.created_at || "",
+      kind: "state",
+      role: "harness",
+      tag: "状态",
+      body: [item.state, item.message].filter(Boolean).join(" · "),
+    })),
+    ...messages.map((item) => ({
+      at: item.created_at || "",
+      kind: "message",
+      role: `${item.sender || "?"} → ${item.recipient || "?"}`,
+      tag: item.kind || "message",
+      body: summarizeMessage(item.content),
+    })),
+  ].sort((left, right) => String(left.at).localeCompare(String(right.at))).slice(0, 14);
+
+  const timeline = items.map((item) => `
+    <li class="timeline-item is-${item.kind}">
+      <div class="timeline-head">
+        <span class="timeline-role">${escapeHtml(item.role)}</span>
+        <span class="timeline-kind">${escapeHtml(item.tag)}</span>
+        <span class="timeline-time">${escapeHtml(formatTime(item.at))}</span>
+      </div>
+      ${item.body ? `<p class="timeline-body">${escapeHtml(item.body)}</p>` : ""}
+    </li>`).join("");
+
+  return `<details class="collab">
+    <summary class="sev-group-head">
+      <i style="background:var(--accent)"></i><span>协作过程</span>
+      <span class="sev-count">${items.length} 个事件</span>
+    </summary>
+    ${roles.length ? `<div class="collab-roles">${roles.map((role) => `<span class="collab-role">${escapeHtml(role)}</span>`).join("")}</div>` : ""}
+    ${collab.stop_reason ? `<p class="collab-stop">终止原因 <b>${escapeHtml(stopReasonLabels[collab.stop_reason] || collab.stop_reason)}</b></p>` : ""}
+    <ul class="timeline">${timeline}</ul>
+  </details>`;
+}
+
+function renderTaskReport(task) {
+  const root = $("#task-report");
+  const raw = $("#task-raw-json");
+  if (raw) raw.textContent = formatJson(task);
+
+  const report = task?.report;
+  if (!report) {
+    const state = String(task?.state || "").toUpperCase();
+    const stateLabel = stateLabels[state] || task?.state || "未知";
+    const error = task?.error;
+    const errorMessage = typeof error === "string" ? error : error?.message || error?.detail || (error ? formatJson(error) : "");
+    const detail = state === "FAILED" ? "本次审查未完成，可检查失败原因后恢复任务。" : state === "CANCELLED" ? "该任务已取消，需要继续时可以恢复任务。" : "任务完成后会在这里显示审查结论与修复建议。";
+    root.innerHTML = `<div class="submission-state">
+      <span class="status state-${escapeHtml(state.toLowerCase())}">${escapeHtml(stateLabel)}</span>
+      <h3>${state === "FAILED" ? "审查未能完成" : state === "CANCELLED" ? "任务已取消" : "审查正在进行"}</h3>
+      <p>${detail}</p>
+      ${errorMessage ? `<p class="inline-error" role="alert">${escapeHtml(errorMessage)}</p>` : ""}
+    </div>`;
+    return;
+  }
+
+  const findings = report.findings || [];
+  const execution = report.execution || {};
+  const budget = execution.review_budget || null;
+  const gates = execution.gates || null;
+  const rejected = Array.isArray(execution.rejected_findings) ? execution.rejected_findings : [];
+  const context = execution.context_management || {};
+  const risk = String(report.risk || "unknown").toLowerCase();
+  const state = stateLabels[String(task.state || "").toUpperCase()] || task.state || "未知";
+
+  const chips = [
+    `<span class="report-chip">${report.pull_request ? `PR #${escapeHtml(report.pull_request)}` : "手动审查"}</span>`,
+    `<span class="report-chip risk-${escapeHtml(risk)}">风险 ${escapeHtml(riskLabels[risk] || risk)}</span>`,
+    report.reviewer ? `<span class="report-chip">${escapeHtml(report.reviewer)}</span>` : "",
+    `<span class="report-chip">${escapeHtml(state)}</span>`,
+  ].filter(Boolean).join("");
+
+  const metrics = [];
+  if (Object.keys(execution).length) {
+    metrics.push(["模型调用", escapeHtml(execution.llm_calls ?? 0)]);
+    metrics.push(["工具调用", escapeHtml(execution.tool_calls ?? 0)]);
+    if (!budget && execution.total_tokens) metrics.push(["Tokens", formatCount(execution.total_tokens)]);
+    if (execution.cost_usd) metrics.push(["成本", `$${Number(execution.cost_usd).toFixed(6)}`]);
+    if (!budget && execution.duration_ms) metrics.push(["耗时", `${Math.round(Number(execution.duration_ms))} ms`]);
+    if (context.compression_calls) metrics.push(["上下文压缩", `${context.compression_calls} 次`]);
+    const recalled = (context.memory_recall || {}).recalled;
+    if (recalled) metrics.push(["记忆召回", String(recalled)]);
+  }
+
+  root.innerHTML = `
+    <div class="report-head">
+      <span class="report-repo">${escapeHtml(report.repository || task.repository || "未命名仓库")}</span>
+      ${chips}
+    </div>
+    ${report.summary ? `<p class="report-summary">${escapeHtml(report.summary)}</p>` : ""}
+    <div class="findings">
+      <div class="findings-label"><span>审查结论</span><span>${findings.length} 项</span></div>
+      ${renderFindings(findings)}
+    </div>
+    ${budget || metrics.length || gates ? `<details class="report-details">
+      <summary>执行与质量详情</summary>
+      ${renderBudget(budget)}
+      ${metrics.length ? `<ul class="report-metrics">${metrics.map(([label, value]) => `<li><small>${label}</small><b>${value}</b></li>`).join("")}</ul>` : ""}
+      ${renderGateSummary(gates, rejected)}
+    </details>` : ""}
+    ${renderCollaboration(task)}`;
+}
+
+const ACTIVE_STATES = new Set(["PENDING", "PLANNING", "EXECUTING", "REVIEWING"]);
+const RESUMABLE_STATES = new Set(["FAILED", "CANCELLED"]);
+
+function setTaskActions(task) {
+  const state = String(task?.state || "").toUpperCase();
+  const hasReport = Boolean(task?.report);
+  $("#task-cancel").classList.toggle("hidden", !ACTIVE_STATES.has(state));
+  $("#task-resume").classList.toggle("hidden", !RESUMABLE_STATES.has(state));
+  $("#copy-report").classList.toggle("hidden", !hasReport);
+  $("#create-fix").classList.toggle("hidden", !(hasReport && task?.pull_request));
+}
+
 async function openTask(id) {
-  show("tasks");
-  $("#task-report").textContent = "正在加载任务报告…";
+  const request = ++taskDetailRequest;
+  const switchingTask = selectedTask !== id;
+  if (!$("#view-tasks").classList.contains("active")) show("tasks");
+  selectedTask = id;
+  selectedTaskData = null;
+  $("#view-tasks").classList.add("is-detail");
+  syncSelection();
+  if ($("#task-selection-label")) $("#task-selection-label").textContent = "正在读取任务详情";
   $("#feedback-panel").classList.add("hidden");
+  if (switchingTask) {
+    $("#feedback-panel").open = false;
+    $("#feedback-form").reset();
+    $("#feedback-missed-fields").classList.add("hidden");
+    $("#feedback-hint").textContent = "提交后可在本任务和演进实验室查看状态。";
+  }
+  const raw = $("#task-raw");
+  if (raw) raw.open = false;
+  $("#task-raw-json").textContent = "";
+  setTaskActions({});
+  $("#task-report").innerHTML = '<div class="empty-state"><span>正在加载任务报告…</span></div>';
   try {
     const task = await api(`/v1/tasks/${encodeURIComponent(id)}`);
-    selectedTask = id;
+    if (request !== taskDetailRequest || selectedTask !== id) return;
     selectedTaskData = task;
-    $("#task-report").textContent = formatJson(task);
-    $("#create-fix").classList.toggle("hidden", !(task.report && task.pull_request));
+    if ($("#task-selection-label")) $("#task-selection-label").textContent = `${task.repository || "未命名仓库"}${task.pull_request ? ` · PR #${task.pull_request}` : " · 手动审查"}`;
+    renderTaskReport(task);
+    syncSelection();
+    setTaskActions(task);
     const feedbackReady = task.state === "SUCCESS" && task.report;
     $("#feedback-panel").classList.toggle("hidden", !feedbackReady);
     if (feedbackReady) {
@@ -255,7 +645,9 @@ async function openTask(id) {
       await loadTaskFeedback(id);
     }
   } catch (error) {
-    $("#task-report").textContent = error.message;
+    if (request !== taskDetailRequest || selectedTask !== id) return;
+    $("#task-report").innerHTML = `<div class="empty-state"><span><b>报告加载失败</b>${escapeHtml(error.message)}</span></div>`;
+    if ($("#task-selection-label")) $("#task-selection-label").textContent = "暂时无法读取此任务";
     selectedTaskData = null;
   }
 }
@@ -269,10 +661,12 @@ const feedbackLabels = {
 
 function populateFeedbackFindings(findings) {
   const select = $("#feedback-finding");
+  const previousValue = select.value;
   select.innerHTML = '<option value="">不关联已有结论</option>' + findings.map((finding, index) => {
     const identity = `${finding.rule_id || "未命名规则"} · ${finding.path || "未知文件"}:${finding.line || "?"}`;
     return `<option value="${index}">${escapeHtml(identity)}</option>`;
   }).join("");
+  if (previousValue !== "" && findings[Number(previousValue)]) select.value = previousValue;
   $("#feedback-result").textContent = "";
 }
 
@@ -303,9 +697,21 @@ async function loadTaskFeedback(taskId) {
     const data = await api(`/v1/tasks/${encodeURIComponent(taskId)}/feedback`);
     if (selectedTask === taskId) renderTaskFeedback(data.cases || []);
   } catch (error) {
-    root.innerHTML = `<p class="feedback-empty">无法读取反馈历史：${escapeHtml(error.message)}</p>`;
+    if (selectedTask === taskId) root.innerHTML = `<p class="feedback-empty">反馈历史读取失败：${escapeHtml(error.message)}</p>`;
   }
 }
+
+const skillDescriptions = {
+  "api-compatibility": ["接口兼容性", "检查接口、配置和数据结构变更，识别对现有调用方的影响。"],
+  "code-quality": ["代码完整性", "检查新增生产代码中的待办标记与尚未完成的实现。"],
+  "correctness-review": ["逻辑正确性", "检查边界条件、数据处理与业务逻辑中的缺陷。"],
+  "database-review": ["数据库变更", "检查查询、事务与数据迁移可能造成的数据问题。"],
+  "observability-review": ["运行可观测性", "检查日志、指标与追踪，帮助定位线上故障。"],
+  "performance-review": ["性能检查", "检查重复计算、资源开销与潜在性能瓶颈。"],
+  "reliability-review": ["稳定性检查", "检查异常处理、重试、并发与故障恢复逻辑。"],
+  "security-review": ["安全检查", "检查输入校验、权限控制与敏感信息等安全问题。"],
+  "test-quality": ["测试质量", "检查测试是否覆盖关键行为、边界条件与失败场景。"],
+};
 
 async function loadSkills() {
   const root = $("#skill-list");
@@ -314,13 +720,20 @@ async function loadSkills() {
     const data = await api("/api/skills");
     renderLlmRuntime(data.llm);
     const skills = (data.skills || []).filter((skill) => skill.name !== "llm-review");
-    root.innerHTML = skills.length ? skills.map((skill) => `
+    root.innerHTML = skills.length ? skills.map((skill) => {
+      const copy = skillDescriptions[skill.name];
+      return `
       <article class="skill-card">
-        <span class="skill-label">${skill.sandboxed ? "SANDBOXED SKILL" : "ACTIVE SKILL"}</span>
-        <h3>${escapeHtml(skill.name)}</h3>
-        <p>${escapeHtml(skill.description || "暂无能力描述")}</p>
-        <span class="skill-meta">v${escapeHtml(skill.version)} · ${escapeHtml(skill.source)}</span>
-      </article>`).join("") : '<div class="empty-state"><span><b>尚未加载 Skill</b>扫描目录以加载可用能力</span></div>';
+        <span class="skill-label">${skill.sandboxed ? "独立沙箱运行" : "已加载能力"}</span>
+        <h3>${escapeHtml(copy?.[0] || skill.name)}</h3>
+        <p>${escapeHtml(copy?.[1] || skill.description || "暂无能力描述")}</p>
+        <details class="skill-details"><summary>能力信息</summary>
+          <span class="skill-meta">${escapeHtml(skill.name)} · v${escapeHtml(skill.version || "1")}</span>
+          <span class="skill-meta">来源：${escapeHtml(skill.source || "未提供")}</span>
+          ${copy && skill.description ? `<p>${escapeHtml(skill.description)}</p>` : ""}
+        </details>
+      </article>`;
+    }).join("") : '<div class="empty-state"><span><b>尚未加载 Skill</b>扫描目录以加载可用能力。</span></div>';
   } catch (error) {
     renderLlmRuntime({ error: true });
     root.innerHTML = '<div class="empty-state"><span>Skills 加载失败</span></div>';
@@ -328,14 +741,66 @@ async function loadSkills() {
   }
 }
 
+const evolutionDecisions = {
+  activated: "已激活新版本",
+  shadow_ready: "已通过评测，等待灰度验证",
+  rejected: "候选未通过评测",
+  deferred: "候选已保存，等待评测条件",
+};
+
+function renderEvolutionStatus(status) {
+  $("#evolution-status").textContent = formatJson(status);
+  const root = $("#evolution-summary");
+  if (!root) return;
+  const checks = [
+    ["审查模型", Boolean(status.model_configured), status.model_configured ? `${status.provider || "已配置"}${status.model ? ` / ${status.model}` : ""}` : "尚未配置模型"],
+    ["验证案例", Number(status.validation_cases || 0) >= Number(status.minimum_cases || 0), `${status.validation_cases ?? 0} / 至少 ${status.minimum_cases ?? 0} 例`],
+    ["独立测试集", Number(status.holdout_cases || 0) >= Number(status.minimum_holdout_cases || 0), `${status.holdout_cases ?? 0} / 至少 ${status.minimum_holdout_cases ?? 0} 例`],
+  ];
+  root.innerHTML = checks.map(([label, ready, detail]) => `<div class="evolution-summary-item">
+    <span>${label}</span><b class="${ready ? "is-ready" : "is-pending"}">${ready ? "已就绪" : "待准备"}</b><small>${escapeHtml(detail)}</small>
+  </div>`).join("");
+  const badge = $("#evolution-ready");
+  if (badge) {
+    badge.textContent = status.ready ? "可以开始评测" : "尚未满足评测条件";
+    badge.className = `status ${status.ready ? "status-online" : "state-pending"}`;
+  }
+}
+
+function renderEvolutionResult(data) {
+  const root = $("#evolution-result");
+  const decision = evolutionDecisions[data.decision] || data.decision || "评测请求已处理";
+  const candidate = data.candidate || {};
+  const baseline = data.baseline || {};
+  const version = typeof data.version === "object" ? data.version?.version : data.version;
+  const reasons = {
+    "candidate prompt is identical to the active version": "候选提示词与当前版本相同，无需重复评测。",
+    "candidate prompt failed the deterministic safety/completeness gate": "候选内容未通过安全或完整性检查，请调整后重试。",
+    "candidate saved but no LLM provider is configured; replay evaluation was not run": "候选已保存。配置审查模型后即可运行回放评测。",
+    "candidate saved but the validation dataset is smaller than the activation minimum": "候选已保存。验证案例数量不足，补充案例后再评测。",
+    "candidate saved but the holdout dataset is smaller than the activation minimum": "候选已保存。独立测试案例不足，补充案例后再评测。",
+    "candidate improved on validation and passed the non-regression holdout gate": "候选效果提升，且独立测试集未出现退步，已激活新版本。",
+    "candidate passed replay gates and is awaiting shadow/canary approval": "候选已通过回放评测，等待后续灰度验证。",
+    "no new supported learning signal was found in unresolved feedback": "当前反馈中没有可用于生成新候选的改进依据。",
+  };
+  const reason = reasons[data.reason] || data.reason || data.note || "";
+  root.classList.remove("empty");
+  root.innerHTML = `<div class="evolution-result-head"><strong>${escapeHtml(decision)}</strong>
+      ${version != null ? `<span class="status status-neutral">版本 ${escapeHtml(version)}</span>` : ""}</div>
+    ${reason ? `<p>${escapeHtml(reason)}</p>` : ""}
+    ${candidate.score != null || baseline.score != null ? `<p class="submission-meta">候选得分 ${Number(candidate.score || 0).toFixed(3)} · 当前版本 ${Number(baseline.score || 0).toFixed(3)}</p>` : ""}
+    <details class="raw-block"><summary>查看评测原始数据</summary><pre>${escapeHtml(formatJson(data))}</pre></details>`;
+}
+
 async function loadFailures() {
+  if ($("#evolution-error")) $("#evolution-error").textContent = "";
   try {
     const [failuresData, status, runsData] = await Promise.all([
       api("/api/failures"),
       api("/v1/evolution/status"),
       api("/v1/evolution/runs?limit=5"),
     ]);
-    $("#evolution-status").textContent = formatJson(status);
+    renderEvolutionStatus(status);
     const cases = failuresData.cases || [];
     const runs = runsData.runs || [];
     const failureHtml = cases.length
@@ -347,19 +812,21 @@ async function loadFailures() {
             </span></span>
             <span class="status ${item.resolved ? "state-success" : "state-pending"}">${item.resolved ? "已解决" : "待处理"}</span>
           </div>`).join("")
-      : '<div class="empty-state"><span><b>暂无失败反馈</b>系统当前没有未处理案例</span></div>';
+      : '<div class="empty-state"><span><b>暂无失败反馈</b>系统当前没有未处理案例。</span></div>';
     const historyHtml = runs.length
       ? `<p class="list-section-label">最近评测</p>${runs.map((run) => `
           <div class="task-row">
             <span class="task-main"><span class="task-glyph">V${escapeHtml(run.candidate_version)}</span><span class="task-copy">
-              <span class="task-name">${escapeHtml(run.decision)}</span>
-              <span class="task-meta">${Number(run.candidate_score).toFixed(3)} vs ${Number(run.baseline_score).toFixed(3)}</span>
+              <span class="task-name">${escapeHtml(evolutionDecisions[run.decision] || run.decision)}</span>
+              <span class="task-meta">候选 ${Number(run.candidate_score || 0).toFixed(3)} · 当前版本 ${Number(run.baseline_score || 0).toFixed(3)}</span>
             </span></span>
           </div>`).join("")}`
       : "";
     $("#failure-list").innerHTML = failureHtml + historyHtml;
   } catch (error) {
     $("#evolution-status").textContent = "暂时无法读取评测状态。";
+    if ($("#evolution-summary")) $("#evolution-summary").innerHTML = '<div class="empty-state"><span>评测状态读取失败，请刷新重试。</span></div>';
+    if ($("#evolution-error")) $("#evolution-error").textContent = error.message;
     $("#failure-list").innerHTML = '<div class="empty-state"><span>反馈加载失败</span></div>';
     toast(error.message);
   }
@@ -370,7 +837,14 @@ $("#review-form").addEventListener("submit", async (event) => {
   const form = event.currentTarget;
   const button = $('button[type="submit"]', form);
   const values = new FormData(form);
-  const body = { repository: values.get("repository"), diff: values.get("diff"), mode: values.get("mode") };
+  const errorOutput = $("#review-error");
+  if (errorOutput) errorOutput.textContent = "";
+  if (modelAvailable === false) {
+    if (errorOutput) errorOutput.textContent = "尚未配置审查模型，请先在服务环境中配置模型，再刷新后提交。";
+    else toast("尚未配置审查模型，请配置模型后再提交。");
+    return;
+  }
+  const body = { repository: String(values.get("repository") || "").trim(), diff: values.get("diff"), mode: values.get("mode") || "agentic" };
   if (values.get("pull_request")) body.pull_request = Number(values.get("pull_request"));
   const asyncQuery = values.get("async") ? "?async=true" : "";
   const output = $("#review-result");
@@ -383,28 +857,126 @@ $("#review-form").addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    output.textContent = formatJson(data);
+    const id = data.task_id || data.id;
+    const taskState = String(data.state || "PENDING").toUpperCase();
+    output.innerHTML = `<div class="submission-state">
+      <span class="status state-${escapeHtml(taskState.toLowerCase())}">${escapeHtml(stateLabels[taskState] || taskState)}</span>
+      <h3>${taskState === "SUCCESS" ? "审查已完成" : "审查任务已提交"}</h3>
+      <p>${taskState === "SUCCESS" ? "报告已生成，可以查看问题详情与修复建议。" : "任务已进入处理队列，可前往任务报告查看进展。"}</p>
+      <p class="submission-meta">${escapeHtml(body.repository)}${body.pull_request ? ` · PR #${body.pull_request}` : " · 手动审查"}</p>
+      ${id ? `<button class="button" type="button" data-submitted-task="${escapeHtml(id)}">查看任务报告</button>` : ""}
+      <details class="raw-block"><summary>查看提交原始数据</summary><pre>${escapeHtml(formatJson(data))}</pre></details>
+    </div>`;
+    $("[data-submitted-task]", output)?.addEventListener("click", () => openTask(id));
     toast("审查任务已成功提交");
     loadDashboard();
   } catch (error) {
-    output.textContent = error.message;
+    if (errorOutput) errorOutput.textContent = `提交失败：${error.message}`;
+    output.innerHTML = '<div class="empty-state"><span><b>审查尚未提交</b>请检查输入与服务配置后重试。</span></div>';
   } finally {
     setButtonBusy(button, false);
   }
 });
+
+function revealRaw(payload) {
+  const raw = $("#task-raw-json");
+  if (raw) raw.textContent = formatJson(payload);
+  const block = $("#task-raw");
+  if (block) block.open = true;
+}
+
+async function postTaskAction(path) {
+  return api(`/v1/tasks/${encodeURIComponent(selectedTask)}/${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+}
 
 $("#create-fix").addEventListener("click", async () => {
   if (!selectedTask) return;
   const button = $("#create-fix");
   setButtonBusy(button, true, "正在创建…");
   try {
-    const data = await api(`/v1/tasks/${encodeURIComponent(selectedTask)}/fix`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
+    const data = await postTaskAction("fix");
+    revealRaw(data);
+    const status = String(data.status || "");
+    const note = String(data.note || "").trim();
+    if (status === "verified-draft") {
+      toast(`修复分支已创建：${data.branch || "已推送"}`, 4200);
+    } else if (status === "stale") {
+      const reviewed = String(data.reviewed_sha || "").slice(0, 7);
+      const current = String(data.current_sha || "").slice(0, 7);
+      toast(`PR 已前进（${reviewed || "旧提交"} → ${current || "新提交"}），请重新审查后再修复`, 5600);
+    } else if (status === "suggestion-only") {
+      toast(`未创建分支：${note || "仅生成修复建议"}`, 5600);
+    } else if (status === "blocked") {
+      toast(`补丁被验证拦截：${note || "未通过结构或测试校验"}`, 5600);
+    } else {
+      toast(note || "修复流程已返回结果", 4200);
+    }
+    await openTask(selectedTask);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
+});
+
+$("#task-cancel").addEventListener("click", async () => {
+  if (!selectedTask) return;
+  const button = $("#task-cancel");
+  setButtonBusy(button, true, "正在取消…");
+  try {
+    const data = await postTaskAction("cancel");
+    toast(data.cancel_requested ? "已提交取消请求" : "取消请求未被接受", 3600);
+    await openTask(selectedTask);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
+});
+
+$("#task-resume").addEventListener("click", async () => {
+  if (!selectedTask) return;
+  const button = $("#task-resume");
+  setButtonBusy(button, true, "正在恢复…");
+  try {
+    const data = await postTaskAction("resume");
+    const message = data.resumed
+      ? "任务已重新入队"
+      : data.state === "SUCCESS" ? "任务已完成，无需恢复" : "恢复请求已发送";
+    toast(message, 3600);
+    await openTask(selectedTask);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
+});
+
+$("#copy-report").addEventListener("click", async () => {
+  if (!selectedTask) return;
+  const button = $("#copy-report");
+  setButtonBusy(button, true, "准备中…");
+  try {
+    const response = await fetch(`/v1/tasks/${encodeURIComponent(selectedTask)}/report`, {
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
     });
-    $("#task-report").textContent = formatJson(data);
-    toast("修复分支已创建");
+    if (!response.ok) throw new Error(`导出失败 (${response.status})`);
+    const markdown = await response.text();
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(markdown);
+      toast(`报告已复制（${markdown.length} 字符）`);
+    } else {
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([markdown], { type: "text/markdown" }));
+      link.download = `pragent-report-${selectedTask.slice(0, 8)}.md`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      toast("报告已下载为 Markdown");
+    }
   } catch (error) {
     toast(error.message);
   } finally {
@@ -487,6 +1059,7 @@ $("#evolution-form").addEventListener("submit", async (event) => {
   const form = event.currentTarget;
   const button = $('button[type="submit"]', form);
   const values = new FormData(form);
+  if ($("#evolution-error")) $("#evolution-error").textContent = "";
   setButtonBusy(button, true, "正在评测…");
   try {
     const data = await api("/v1/evolution/propose", {
@@ -494,11 +1067,11 @@ $("#evolution-form").addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ skill_name: values.get("skill_name"), prompt: values.get("prompt") }),
     });
-    $("#evolution-result").classList.remove("empty");
-    $("#evolution-result").textContent = formatJson(data);
-    toast("新旧版本回放评测已完成");
+    renderEvolutionResult(data);
+    toast(evolutionDecisions[data.decision] || "评测请求已处理");
     loadFailures();
   } catch (error) {
+    if ($("#evolution-error")) $("#evolution-error").textContent = `评测失败：${error.message}`;
     toast(error.message);
   } finally {
     setButtonBusy(button, false);
@@ -507,6 +1080,7 @@ $("#evolution-form").addEventListener("submit", async (event) => {
 
 $("#auto-evolve").addEventListener("click", async () => {
   const button = $("#auto-evolve");
+  if ($("#evolution-error")) $("#evolution-error").textContent = "";
   setButtonBusy(button, true, "正在生成…");
   try {
     const data = await api("/v1/evolution/auto", {
@@ -514,11 +1088,11 @@ $("#auto-evolve").addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ skill_name: "llm-review" }),
     });
-    $("#evolution-result").classList.remove("empty");
-    $("#evolution-result").textContent = formatJson(data);
-    toast("反馈候选评测已完成");
+    renderEvolutionResult(data);
+    toast(evolutionDecisions[data.decision] || "反馈候选请求已处理");
     loadFailures();
   } catch (error) {
+    if ($("#evolution-error")) $("#evolution-error").textContent = `候选生成失败：${error.message}`;
     toast(error.message);
   } finally {
     setButtonBusy(button, false);
@@ -526,13 +1100,17 @@ $("#auto-evolve").addEventListener("click", async () => {
 });
 
 $("#refresh").addEventListener("click", async () => {
+  const button = $("#refresh");
+  setButtonBusy(button, true, "刷新中…");
   const view = location.hash.slice(1) || "overview";
-  if (view === "overview") await loadDashboard();
-  else if (view === "tasks") await loadTasks();
-  else if (view === "skills") await loadSkills();
-  else if (view === "evolution") await loadFailures();
-  else await loadDashboard();
-  toast("数据已刷新");
+  try {
+    if (view === "tasks") await Promise.all([loadTasks(), selectedTask && $("#view-tasks").classList.contains("is-detail") ? openTask(selectedTask) : Promise.resolve()]);
+    else if (view === "skills") await loadSkills();
+    else if (view === "evolution") await loadFailures();
+    else await loadDashboard();
+  } finally {
+    setButtonBusy(button, false);
+  }
 });
 
 $("#login-form").addEventListener("submit", async (event) => {
@@ -557,6 +1135,10 @@ $("#login-form").addEventListener("submit", async (event) => {
     $("#logout").classList.remove("hidden");
     $("#login-error").textContent = "";
     await loadDashboard();
+    const view = location.hash.slice(1);
+    if (view === "tasks") await Promise.all([loadTasks(), selectedTask ? openTask(selectedTask) : Promise.resolve()]);
+    else if (view === "skills") await loadSkills();
+    else if (view === "evolution") await loadFailures();
   } catch (error) {
     $("#login-error").textContent = error.message;
   } finally {
@@ -573,14 +1155,78 @@ $("#logout").addEventListener("click", () => {
 
 const diffInput = $('textarea[name="diff"]', $("#review-form"));
 const diffStats = $("#diff-stats");
+const dropHint = $("#diff-drop-hint");
+const diffFileInput = $("#review-file-input");
+
+$("#upload-diff")?.addEventListener("click", () => diffFileInput?.click());
+diffFileInput?.addEventListener("change", async () => {
+  await loadDiffFile(diffFileInput.files?.[0]);
+  diffFileInput.value = "";
+});
+
 function updateDiffStats() {
   const value = diffInput.value;
   const lines = value ? value.split(/\r?\n/).length : 0;
   diffStats.textContent = `${lines} 行，${value.length} 字符`;
 }
+
+async function loadDiffFile(file) {
+  if (!file) return;
+  if (file.size > 512 * 1024) {
+    const message = "文件超过 512 KB，请拆分后再提交";
+    if ($("#review-error")) $("#review-error").textContent = message;
+    toast(message);
+    return;
+  }
+  try {
+    diffInput.value = await file.text();
+    if ($("#review-error")) $("#review-error").textContent = "";
+    updateDiffStats();
+    diffInput.focus();
+    toast(`已载入 ${file.name}`);
+  } catch (error) {
+    toast(`文件读取失败：${error.message}`);
+  }
+}
+
 diffInput.addEventListener("input", updateDiffStats);
 updateDiffStats();
 
+["dragenter", "dragover"].forEach((type) => {
+  diffInput.addEventListener(type, (event) => {
+    event.preventDefault();
+    dropHint.classList.add("is-active");
+  });
+});
+["dragleave", "drop", "dragend"].forEach((type) => {
+  diffInput.addEventListener(type, () => dropHint.classList.remove("is-active"));
+});
+diffInput.addEventListener("drop", (event) => {
+  const file = event.dataTransfer?.files?.[0];
+  if (!file) return;
+  event.preventDefault();
+  loadDiffFile(file);
+});
+
 if (accessToken) $("#logout").classList.remove("hidden");
+
+function applyTheme(theme) {
+  const dark = theme === "dark";
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  const button = $("#theme-toggle");
+  if (button) {
+    button.textContent = dark ? "浅色外观" : "深色外观";
+    button.setAttribute("aria-label", dark ? "切换为浅色外观" : "切换为深色外观");
+  }
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#101216" : "#f6f7f9");
+}
+
+applyTheme(localStorage.getItem("pragent_theme") || "light");
+$("#theme-toggle")?.addEventListener("click", () => {
+  const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  localStorage.setItem("pragent_theme", theme);
+  applyTheme(theme);
+});
+
 show(location.hash.slice(1) || "overview", false);
-loadDashboard();
+if (location.hash && location.hash !== "#overview") loadDashboard();

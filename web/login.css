@@ -1,63 +1,64 @@
+/* Login shares the workspace theme and form tokens. */
+
 .login-overlay {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: 150;
   display: grid;
   place-items: center;
   padding: 16px;
-  background: rgba(7, 8, 10, .88);
-  backdrop-filter: blur(14px);
+  overflow-y: auto;
+  background: var(--bg);
+  animation: overlay-in .2s ease;
 }
+@keyframes overlay-in { from { opacity: 0; } to { opacity: 1; } }
 
 .login-card {
-  width: min(430px, calc(100vw - 32px));
-  padding: 34px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-panel);
-  background: #14181e;
-  box-shadow: 0 30px 100px rgba(0, 0, 0, .52);
+  width: min(400px, calc(100vw - 32px));
+  padding: 28px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow);
 }
 
 .login-brand {
   display: flex;
   align-items: center;
   gap: 11px;
-  margin-bottom: 34px;
+  margin-bottom: 24px;
   color: var(--ink);
-  font-size: 16px;
-  font-weight: 720;
-}
-
-.login-brand .brand-mark {
-  width: 38px;
-  height: 38px;
-  flex-basis: 38px;
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  letter-spacing: -.3px;
 }
 
 .login-card h2 {
-  margin: 0 0 7px;
-  font-size: 28px;
-  letter-spacing: -1px;
+  margin: 0 0 5px;
+  font-size: 22px;
+  font-weight: 680;
+  letter-spacing: -.6px;
 }
 
 .login-lead {
-  margin: 0 0 25px;
+  margin: 0 0 22px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 
 .login-card .button {
   width: 100%;
-  margin-top: 5px;
+  margin-top: 2px;
 }
 
 .login-error {
   min-height: 18px;
-  margin: 13px 0 0;
-  color: #ffabab;
-  font-size: 11px;
+  margin: 12px 0 0;
+  color: var(--red);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
 }
 
 @media (max-width: 480px) {
-  .login-card { padding: 27px 23px; }
+  .login-card { padding: 22px 20px; }
 }
