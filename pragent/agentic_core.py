@@ -1249,6 +1249,7 @@ class AgenticReviewer(Reviewer):
         for index, finding in enumerate(candidates):
             decision = by_index.get(index)
             accepted = bool(decision and decision.get("accepted"))
+            adjustment = 0.0
             if decision:
                 try:
                     adjustment = float(decision.get("confidence_adjustment", 0))
@@ -1262,6 +1263,10 @@ class AgenticReviewer(Reviewer):
                 )
             decisions.append({
                 "finding_index": index, "accepted": accepted,
+                # Recorded so a later audit can explain why a finding fell below
+                # or rose above the confidence gate instead of guessing.
+                "confidence_adjustment": adjustment,
+                "confidence_after": finding.confidence,
                 "objections": (decision or {}).get(
                     "objections", ["critic returned no explicit decision"]
                 ),
@@ -1288,6 +1293,9 @@ class AgenticReviewer(Reviewer):
             except (TypeError, ValueError):
                 adjustment = 0.0
             finding.confidence = max(0.0, min(1.0, finding.confidence + adjustment))
+            # The Lead saw the critic objections and still chose to publish, so
+            # record that authority for the confidence gate to honour.
+            finding.lead_accepted = True
             accepted.append(finding)
         return accepted
 

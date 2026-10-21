@@ -91,13 +91,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._headers(200, content_type, len(body))
         self.wfile.write(body)
 
-    def _read_body(self) -> bytes:
+    def _read_body(self, allow_empty: bool = False) -> bytes:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             raise ValueError("invalid Content-Length")
         limit = self.settings.max_diff_bytes + 256 * 1024
-        if length <= 0 or length > limit:
+        if length > limit:
+            raise ValueError("request body is empty or too large")
+        if length <= 0:
+            # Bodyless POSTs are legitimate for cancel/resume/reload/replay, so
+            # the caller decides whether an empty payload is acceptable. Endpoints
+            # that need JSON still fail on _read_json(b"") with a 400.
+            if allow_empty:
+                return b""
             raise ValueError("request body is empty or too large")
         return self.rfile.read(length)
 
@@ -308,7 +315,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         path = parsed_url.path
         query = urllib.parse.parse_qs(parsed_url.query)
         try:
-            body = self._read_body()
+            body = self._read_body(allow_empty=True)
             if path == "/v1/auth/login":
                 if not self.settings.auth_required:
                     self._send_json(409, {"error": "authentication is disabled"})

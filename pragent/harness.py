@@ -172,7 +172,10 @@ class ReviewHarness:
             run_mode, components, execution = {}, [], {}
         report = ReviewReport(
             repository=state["repository"], pull_request=state.get("pull_request"),
-            summary=self._summary(findings, len(parsed.files), risk), risk=risk,
+            summary=self._summary(
+                findings, len(parsed.files), risk,
+                withheld=len(execution.get("rejected_findings") or []),
+            ), risk=risk,
             findings=findings, files_reviewed=parsed.files, reviewer=self.reviewer.name,
             collaboration=collaboration,
             run_mode=run_mode, components=components, execution=execution,
@@ -249,8 +252,13 @@ class ReviewHarness:
         return "low"
 
     @staticmethod
-    def _summary(findings, file_count: int, risk: str) -> str:
+    def _summary(findings, file_count: int, risk: str, withheld: int = 0) -> str:
         if not findings:
+            if withheld:
+                return (
+                    "Reviewed %d file(s); %d candidate issue(s) were withheld by the "
+                    "release gates and not published." % (file_count, withheld)
+                )
             return "Reviewed %d file(s); no actionable issue was detected in added lines." % file_count
         return "Reviewed %d file(s); found %d actionable issue(s). Overall risk: %s." % (
             file_count, len(findings), risk,

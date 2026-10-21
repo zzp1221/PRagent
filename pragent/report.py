@@ -57,14 +57,47 @@ def to_markdown(report: Dict[str, Any]) -> str:
             "- Protocol: `%s`" % collaboration.get("protocol", "unknown"),
             "- Actual roles: `%s`" % ", ".join(collaboration.get("roles") or []),
             "- Candidate findings: `%s`; critic decisions: `%s`" % (
-                collaboration.get("candidate_findings", 0),
+                # The collaboration payload stores the pre-critic count under
+                # candidate_findings_before_critic; reading the bare key always
+                # fell back to 0 and contradicted the critic decision count.
+                collaboration.get(
+                    "candidate_findings_before_critic",
+                    collaboration.get("candidate_findings", 0),
+                ),
                 len(collaboration.get("critic_decisions") or []),
             ),
             "",
         ])
     findings = report.get("findings", [])
     if not findings:
-        lines.append("✅ No actionable issue detected in the added lines.")
+        withheld = execution.get("rejected_findings") or []
+        if withheld:
+            # Surface the gate rejections: an empty report that hides candidates
+            # looks identical to a clean review and cannot be diagnosed.
+            lines.extend([
+                "## Findings withheld by the gates",
+                "",
+                "The review produced candidate findings, but none of them cleared "
+                "every gate:",
+                "",
+            ])
+            for index, item in enumerate(withheld, 1):
+                lines.append(
+                    "%d. `%s:%s` · `%s`" % (
+                        index, item.get("path", ""), item.get("line", 0),
+                        item.get("rule_id", ""),
+                    )
+                )
+                for reason in item.get("reasons") or []:
+                    lines.append("    - %s" % reason)
+            lines.extend([
+                "",
+                "These candidates were not published. Widen the diff, add tests or "
+                "evidence to raise their confidence before re-running the review.",
+                "",
+            ])
+        else:
+            lines.append("✅ No actionable issue detected in the added lines.")
         return "\n".join(lines) + "\n"
     lines.extend(["## Findings", ""])
     icons = {"critical": "🚨", "high": "🔴", "medium": "🟠", "low": "🟡"}

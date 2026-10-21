@@ -51,6 +51,10 @@ class Finding:
     call_chain: List[Dict[str, Any]] = field(default_factory=list)
     source: str = "unknown"
     gate: Dict[str, Any] = field(default_factory=dict)
+    # Set when the Lead explicitly selected this finding for publication. The
+    # confidence gate must not overrule that decision, otherwise the whole
+    # collaboration result gets silently discarded at the last step.
+    lead_accepted: bool = False
     # Canonical taxonomy used for evaluation.  rule_id remains an internal or
     # reviewer-specific label and is not required to be stable across models.
     cwe: Optional[str] = None

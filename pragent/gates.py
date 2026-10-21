@@ -144,7 +144,7 @@ class FindingGate:
                     "evidence gate: high-risk finding requires AST/scanner/call-chain evidence"
                 )
                 counters["evidence"] += 1
-            if finding.confidence < self.minimum_confidence:
+            if finding.confidence < self.minimum_confidence and not finding.lead_accepted:
                 reasons.append("confidence gate: score below %.2f" % self.minimum_confidence)
                 counters["confidence"] += 1
             if finding.severity in {Severity.CRITICAL, Severity.HIGH} and (
@@ -155,6 +155,7 @@ class FindingGate:
 
             finding.gate = {
                 "passed": not reasons, "reasons": reasons,
+                "lead_accepted": finding.lead_accepted,
                 "exact_location_evidence": exact_line,
                 "strong_evidence_count": len(strong_refs),
                 "verified_evidence_count": len(valid_refs),
