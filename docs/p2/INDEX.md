@@ -18,7 +18,7 @@
 | step3 | `symbol` 多语言定义查找 + `confidence`/`scope` 标注 | `029748e` |
 | step4 | 文案诚实化 + 真实 PR 端到端验证 | `0167c2e` |
 | step5 | 框架超时不再先于审查预算触发 | `09b5324` |
-| step6 | Critic 拿到工具后退化为「看一眼就点头」 | 见下 |
+| step6 | Critic 拿到工具后退化为「看一眼就点头」 | `f7ece65` `2924aa0` |
 
 ## 解决了什么
 
@@ -117,6 +117,34 @@ PR 评论已按 marker `<!-- pragent-review:zzp1221/PRagent#3 -->` 回写。
 工具调用」之后，原来够用的两个上限（超时、盲审步数）不再够用**。这正是端到端验证的价值：
 单测覆盖不到这类「预算与深度不匹配」的问题。
 
+### 第三轮：36 文件，两个修复都生效
+
+任务 `2af51484-5f44-45b7-8368-fee529536abb`，head `bc98647`，**SUCCESS**，126 秒。
+
+```json
+{"available": true, "file_count": 36, "source_kind": "pinned-files", "root_supplied": false}
+```
+
+`review_budget` 全项未耗尽：`model_calls=18`、`tokens_used=207021 / 288000`、
+`elapsed=126.2s / 480s`、`exhausted: ""`。
+
+关键差异在 Critic —— 它这次真的做了两次独立查证：
+
+| 角色 | 工具 | 参数 |
+|---|---|---|
+| security | `read_file` | `pragent/repository_source.py` 1-200 |
+| security | `read_file` | `pragent/repository_tools.py` 1-200 |
+| security | `read_file` | `pragent/github.py` 1-120 |
+| security | `search_repository` | `query="eval("` |
+| critic | `read_file` | `pragent/service.py` 280-320 |
+| critic | `read_file` | `pragent/service.py` 260-312 |
+
+第二轮里 Critic 只有一次 `read_file`（`service.py` 270-320）就被步数掐死；
+这次它能用两步分别读 280-320 与 260-312，第三步在无工具的约束下出结论。
+产出仍是 2 条 medium finding，指向 provider 的宽泛 `except Exception`。
+PR 评论按同一 marker `<!-- pragent-review:zzp1221/PRagent#3 -->` upsert 更新，
+没有堆叠新评论。
+
 ## 仍然存在的边界
 
 - **冻结集只含被改文件，不含其调用方**：跨文件因果推理需要「谁调用了这个函数」，
@@ -126,6 +154,10 @@ PR 评论已按 marker `<!-- pragent-review:zzp1221/PRagent#3 -->` 回写。
 - **`git_context` 在远程形态下不可用**：contents API 不提供 blame 与提交历史。
 - **`file_count` 对 `LocalTree` 为 `None`**：枚举目录是 `os.walk` 全遍历，不在报告里重复付费。
 - **并发审查会互相拖慢**：同一轮轮询提交多个 PR 时它们争抢模型配额。step5 让这种情况
-  表现为「软上限带原因地触发」，但没有做并发限流。
-- **A 型让审查变慢**：真实 PR 从「读 diff」变成「读 25-29 个文件、20+ 次工具调用」，
-  耗时 95-140 秒。这是用时间换上下文的取舍，不是待修的缺陷。
+  表现为「软上限带原因地触发」，step6 让单角色步数耗尽降级而不是打掉整次审查，
+  但没有做并发限流。
+- **A 型让审查变慢**：真实 PR 从「读 diff」变成「读 25-36 个文件、20+ 次工具调用」，
+  耗时 95-126 秒。这是用时间换上下文的取舍，不是待修的缺陷。
+- **`degrade_on_exhaustion` 会产出没有 Critic 裁决的结果**：critic 万一耗尽，报告里
+  的 finding 就是未经挑战的候选。降级比整次失败好，但报告没有标注这一点，
+  目前只能从 trace 的 `budget_exhausted degraded=True` 看出来。

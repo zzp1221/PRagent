@@ -27,8 +27,11 @@
 ## 验证
 
 - [x] 全量回归：**235 用例，0 失败 0 错误**（step6 新增 2）
-- [ ] 推一个新提交到 PR #3，确认 29 文件规模不再因 critic 步数失败
-- [ ] 第三次审查报告 `repository_context` 仍为 `pinned-files`
+- [x] 推一个新提交到 PR #3，确认 36 文件规模不再因 critic 步数失败
+      （任务 `2af51484`，SUCCESS，126 秒）
+- [x] 第三次审查报告 `repository_context` 仍为 `pinned-files`，`file_count=36`
+- [x] Critic 真的做了两次 `read_file`（`service.py` 280-320 与 260-312），
+      第三步在无工具约束下出结论
 
 ## 实施记录
 
