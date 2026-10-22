@@ -203,12 +203,10 @@ if ($compose) {
     # A stale PRAGENT_PUBLIC_BASE_URL in the shell wins over .env during compose
     # interpolation, so pin it here instead of trusting the file alone.
     $env:PRAGENT_PUBLIC_BASE_URL = $publicUrl
-    # docker reports progress on stderr; under ErrorActionPreference=Stop that
-    # would abort the script before the health wait, so relax it for this call.
-    $ErrorActionPreference = "Continue"
-    & docker compose up -d --force-recreate --no-deps pragent 2>&1 | Select-Object -Last 3
+    # docker writes its progress to stderr, which PowerShell would turn into a
+    # terminating error; discard it and judge success by the exit code alone.
+    & docker compose up -d --force-recreate --no-deps pragent 2>$null | Select-Object -Last 3
     $composeExit = $LASTEXITCODE
-    $ErrorActionPreference = "Stop"
     if ($composeExit -ne 0) { Write-Warning "docker compose up -d exited with code $composeExit" }
 }
 

@@ -35,6 +35,7 @@ param(
     [int]$GatewayPort = 8081,
     [switch]$ExposeAdmin,
     [switch]$SkipCompose,
+    [string]$SyncWebhook = "",
     [switch]$Stop
 )
 
@@ -58,9 +59,12 @@ function Stop-Tracked {
         if (Test-Path -LiteralPath $file) {
             $tracked = (Get-Content -LiteralPath $file -Raw).Trim()
             if ($tracked) {
-                Get-Process -Id $tracked -ErrorAction SilentlyContinue | ForEach-Object {
-                    Write-Host "Stopping $($_.ProcessName) (pid $($_.Id))"
-                    Stop-Process -Id $_.Id -Force
+                $proc = Get-Process -Id $tracked -ErrorAction SilentlyContinue
+                # Pids are recycled across reboots: never touch a process that is
+                # not ours, or a stale pid file could kill something unrelated.
+                if ($proc -and $proc.ProcessName -in @("node", "cloudflared")) {
+                    Write-Host "Stopping $($proc.ProcessName) (pid $($proc.Id))"
+                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
                 }
             }
             Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
@@ -69,7 +73,7 @@ function Stop-Tracked {
     # A leftover quick tunnel from an earlier run would keep a stale hostname alive.
     Get-Process cloudflared -ErrorAction SilentlyContinue | ForEach-Object {
         Write-Host "Stopping stray cloudflared (pid $($_.Id))"
-        Stop-Process -Id $_.Id -Force
+        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -186,12 +190,10 @@ if (-not $SkipCompose -and (Get-Command docker -ErrorAction SilentlyContinue)) {
     # A stale PRAGENT_PUBLIC_BASE_URL in the shell wins over .env during compose
     # interpolation, so pin it here instead of trusting the file alone.
     $env:PRAGENT_PUBLIC_BASE_URL = $publicUrl
-    # docker reports progress on stderr; under ErrorActionPreference=Stop that
-    # would abort the script before the health wait, so relax it for this call.
-    $ErrorActionPreference = "Continue"
-    & docker compose up -d --force-recreate --no-deps pragent 2>&1 | Select-Object -Last 3
+    # docker writes its progress to stderr, which PowerShell would turn into a
+    # terminating error; discard it and judge success by the exit code alone.
+    & docker compose up -d --force-recreate --no-deps pragent 2>$null | Select-Object -Last 3
     $composeExit = $LASTEXITCODE
-    $ErrorActionPreference = "Stop"
     if ($composeExit -ne 0) { Write-Warning "docker compose up -d exited with code $composeExit" }
     foreach ($attempt in 1..30) {
         Start-Sleep -Seconds 2
@@ -207,6 +209,27 @@ $secret = ""
 if (Test-Path -LiteralPath $envPath) {
     $secretLine = [System.IO.File]::ReadAllLines($envPath) | Where-Object { $_ -match "^\s*PRAGENT_GITHUB_WEBHOOK_SECRET\s*=" } | Select-Object -First 1
     if ($secretLine) { $secret = $secretLine.Split("=", 2)[1].Trim() }
+}
+
+# A quick tunnel gets a fresh hostname every run, so keep the GitHub hook in
+# sync when the caller names a repository instead of editing it by hand.
+if ($SyncWebhook) {
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Write-Warning "gh CLI not found; update the webhook for $SyncWebhook by hand."
+    } else {
+        $hooks = & gh api "repos/$SyncWebhook/hooks" 2>$null | Out-String | ConvertFrom-Json
+        $synced = 0
+        foreach ($hook in $hooks) {
+            if ([string]$hook.config.url -notlike "*trycloudflare.com*") { continue }
+            $config = @{ url = $webhookUrl; content_type = "json" }
+            if ($secret) { $config["secret"] = $secret }
+            $body = @{ config = $config } | ConvertTo-Json -Compress
+            $body | & gh api -X PATCH "repos/$SyncWebhook/hooks/$($hook.id)" --input - 2>$null | Out-Null
+            Write-Host "Updated GitHub webhook $($hook.id) on $SyncWebhook"
+            $synced++
+        }
+        if ($synced -eq 0) { Write-Host "No trycloudflare webhook found on $SyncWebhook; nothing to update." }
+    }
 }
 
 Write-Host ""
