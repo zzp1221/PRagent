@@ -1,6 +1,6 @@
 # PRAgent 多智能体代码审查
 
-PRAgent 把一次代码审查拆成一场可审计的多 Agent 协作：Lead 判定风险并分配任务，安全与正确性/可靠性两个 Worker 用仓库工具取证，Critic 盲审挑战结论，最后所有 finding 必须通过证据与置信度门禁才能发布。审查结果既回写 PR，也留在控制台里可追踪、可反馈、可回流成下一次的改进。
+PRAgent 把一次代码审查拆成一场可审计的多 Agent 协作：Lead 判定风险并分配任务，安全与正确性/可靠性两个 Worker 用本次变更涉及的文件与 diff 取证，Critic 盲审挑战结论，最后所有 finding 必须通过证据与置信度门禁才能发布。审查结果既回写 PR，也留在控制台里可追踪、可反馈、可回流成下一次的改进。
 
 正式审查入口是 `agentic` 模式，一次普通任务固定 5 次模型调用；高风险任务允许一轮 Worker 返工。每次调用的 token、耗时、证据引用与门禁结论都写进任务轨迹，报告里能直接看到钱花在哪、结论凭什么成立。
 
@@ -12,7 +12,8 @@ PRAgent 把一次代码审查拆成一场可审计的多 Agent 协作：Lead 判
 
 - 统一 diff 解析，只定位新增代码与新文件行号，输出结构化问题、修复建议和测试建议
 - Agentic 协作：Lead + Security + Correctness/Reliability + Critic，高风险最多一轮返工
-- 带 Tool Registry、参数 Schema 校验和结构化 Observation 的 Agent Loop，Worker 可按需调用仓库工具取证
+- 带 Tool Registry、参数 Schema 校验和结构化 Observation 的 Agent Loop，Worker 可按需读文件全文、查符号定义与调用点、定位相关测试
+- 文件上下文：webhook 与轮询审查按被审提交的 SHA 读取本次变更涉及的文件全文，没有本地 checkout 也能看到完整函数而不只是 diff 片段；改动文件之外的调用方不在这个范围内
 - 自研 Agent Runtime：持久化 checkpoint、执行预算、任务断点续跑与取消
 - 质量门禁：格式、精确位置证据、强证据引用、置信度与发布条件，未通过的候选会在报告里单独披露
 
@@ -510,7 +511,7 @@ Skill 可以附带文本资源（例如规范摘录、查询模板或测试清�
         ↓ 只暴露 name/description 给 Lead
 Lead 选择相关 Skill
         ↓ 注入 instructions，并收窄 allowed-tools
-Worker 使用仓库工具取证
+Worker 使用文件内容与 diff 取证
         ↓
 Finding gate 校验格式、证据、置信度和发布条件
 ```
