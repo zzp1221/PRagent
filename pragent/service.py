@@ -157,7 +157,8 @@ class ReviewService:
         self.registry.reload()
         reviewer = self._build_agentic_reviewer(chat_client, effective)
         harness = ReviewHarness(
-            self.store, reviewer, effective.max_steps, effective.timeout_seconds,
+            self.store, reviewer, effective.max_steps,
+            effective.resolved_runtime_timeout(),
             observability=self.observability,
         )
         fixer = (

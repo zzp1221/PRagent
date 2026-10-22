@@ -164,6 +164,17 @@ class Settings:
             "review_max_model_calls": self.agent_review_max_model_calls,
         }
 
+    def resolved_runtime_timeout(self) -> int:
+        """Framework hard kill must outlive the review's own time budget.
+
+        Otherwise the runtime aborts first with no reason and the soft ceiling
+        that reports "seconds X/Y" never gets a chance to explain itself.
+        """
+        budget = self.resolved_review_budget()["review_time_budget_seconds"]
+        # The extra minute covers the unwind: worker threads, trace writes and
+        # the state transition that turns the soft ceiling into a clear error.
+        return max(int(self.timeout_seconds), int(budget) + 60)
+
     def resolved_llm(self) -> Dict[str, object]:
         """Resolve a named provider to the existing OpenAI-compatible transport."""
         provider = self.llm_provider.strip().lower()
