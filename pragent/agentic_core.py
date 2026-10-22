@@ -763,7 +763,10 @@ class AgenticReviewer(Reviewer):
                 diff, candidates,
                 str(final_assessment.get("critic_objective", "")),
                 suite, ledger, task_id, memory_context,
-                max_steps=2 if critic_tools else 1,
+                # With a source available the critic can look things up, and one
+                # lookup is not enough to challenge anything: it needs room for
+                # two verification queries plus the final decision.
+                max_steps=3 if critic_tools else 1,
                 allow_tools=critic_tools,
             )
             candidates, decisions = self._apply_critic(critic_result, candidates)

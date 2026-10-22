@@ -8,7 +8,8 @@
 对应 `docs/p0/INDEX.md:78-79` 登记的遗留边界「Webhook 链路仍未准备仓库快照」。
 
 拆成多步，因为「把抽象换成可插拔」「真的去拉文件」「提高符号精度」「改文案」
-「修超时分层」是五种不同性质的风险。混在一次提交里出问题时无法判断是哪一层坏的。
+「修超时分层」「修盲审深度」是六种不同性质的风险。混在一次提交里出问题时无法判断是
+哪一层坏的。
 
 | 步骤 | 主题 | 提交 |
 |---|---|---|
@@ -16,7 +17,8 @@
 | step2 | 远程取文件：GitHub contents API + service 层 provider | `5246505` |
 | step3 | `symbol` 多语言定义查找 + `confidence`/`scope` 标注 | `029748e` |
 | step4 | 文案诚实化 + 真实 PR 端到端验证 | `0167c2e` |
-| step5 | 框架超时不再先于审查预算触发 | 见下 |
+| step5 | 框架超时不再先于审查预算触发 | `09b5324` |
+| step6 | Critic 拿到工具后退化为「看一眼就点头」 | 见下 |
 
 ## 解决了什么
 
@@ -43,12 +45,16 @@
 
 **step4**：README 不再承诺「Worker 用仓库工具取证」。现在写的是默认路径按被审提交的 SHA
 读取本次变更涉及的文件全文，并明确「改动文件之外的调用方不在这个范围内」。
-这一句是被删掉的夸大表述，也是被补上的真实边界。
 
 **step5**：`Settings.resolved_runtime_timeout()` 让框架硬杀不小于审查自身的软上限
 加一分钟收尾余量。此前 `runtime.py:164` 的 120 秒硬杀永远先于 480 秒的
 `review_time_budget_seconds` 触发，用户只会看到无原因的
 `task execution budget exceeded`。
+
+**step6**：critic 拿到仓库源时从 2 步提到 3 步（两次验证查询 + 一次决定）。
+A 型之前 `critic_tools` 恒为假、critic 永远单步盲审；A 型之后它可能拿到 29 个文件的
+冻结集，却只有「一次查询 + 一次回答」的空间，真实链路因此以
+`critic step budget exhausted` 失败过。
 
 ## 回归基线
 
@@ -59,14 +65,18 @@ python -c "import sys,pathlib,unittest; sys.path.insert(0,'.'); sys.path.insert(
 ```
 
 进入 P2 前：176。step1 后 199。step2 后 215。step3 后 227。step4 后 227。
-step5 后 **233，0 失败 0 错误**。
+step5 后 233。step6 后 **234，0 失败 0 错误**。
 
 ## 端到端验证（PR #3）
 
-https://github.com/zzp1221/PRagent/pull/3 — 25 文件 / 1976 增行 / 95KB diff。
+https://github.com/zzp1221/PRagent/pull/3
 
 用轮询路径触发（本机没有 `cloudflared`，公网隧道不可用；轮询不需要公网入口，而且它正是
-本方向要修的「另一条主路径」）。任务 `545fc4f1-a020-4990-a25b-9ecda95e9373`，SUCCESS。
+本方向要修的「另一条主路径」）。
+
+### 第一轮：25 文件，成功
+
+任务 `545fc4f1-a020-4990-a25b-9ecda95e9373`，SUCCESS，head `0167c2e`。
 
 报告：`{"available": true, "file_count": 25, "source_kind": "pinned-files", "root_supplied": false}`
 
@@ -85,8 +95,20 @@ Worker 与 Critic 的真实工具调用（全部 `ok: true`；step1 之前这些
 产出 2 条 medium finding，都指向本轮新写的 provider 代码的宽泛 `except Exception`；
 证据引用 `read_file:548bf61cd2e049bd` 通过了门禁的 ledger 与路径归属校验。
 PR 评论已按 marker `<!-- pragent-review:zzp1221/PRagent#3 -->` 回写。
-
 成本：16 次模型调用、21 次工具调用、183465 tokens、95.2 秒。
+
+### 第二轮：29 文件，暴露两个真实缺陷
+
+任务 `0b8ea657-3d18-4828-8637-99211c6a98c6`，head `b82579c`，FAILED。
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| 同一轮轮询的 PR #1 任务 139 秒后失败，错误无原因 | 框架硬杀 120 秒先于审查软上限 480 秒触发 | step5 |
+| 29 文件审查在 `critic step budget exhausted` 失败 | critic 有工具但只有 2 步 | step6 |
+
+两次失败都不是 A 型的逻辑错误，而是 **A 型把审查从「读 diff」变成「读几十个文件 + 二十余次
+工具调用」之后，原来够用的两个上限（超时、盲审步数）不再够用**。这正是端到端验证的价值：
+单测覆盖不到这类「预算与深度不匹配」的问题。
 
 ## 仍然存在的边界
 
@@ -96,8 +118,7 @@ PR 评论已按 marker `<!-- pragent-review:zzp1221/PRagent#3 -->` 回写。
   但不能确定它指向哪个同名符号。非 Python 是正则级，不是 AST 级。
 - **`git_context` 在远程形态下不可用**：contents API 不提供 blame 与提交历史。
 - **`file_count` 对 `LocalTree` 为 `None`**：枚举目录是 `os.walk` 全遍历，不在报告里重复付费。
-- **并发审查会互相拖慢**：同一轮轮询提交多个 PR 时它们争抢模型配额。step5 把框架超时
-  抬到审查预算之上，让这种情况表现为「软上限带原因地触发」而不是「硬杀无原因」，
-  但没有做并发限流。
-- **A 型让审查变慢**：真实 PR 从「读 diff」变成「读 25 个文件 + 21 次工具调用」，
-  耗时 98 秒。这是用时间换上下文的取舍，不是待修的缺陷。
+- **并发审查会互相拖慢**：同一轮轮询提交多个 PR 时它们争抢模型配额。step5 让这种情况
+  表现为「软上限带原因地触发」，但没有做并发限流。
+- **A 型让审查变慢**：真实 PR 从「读 diff」变成「读 25-29 个文件、20+ 次工具调用」，
+  耗时 95-140 秒。这是用时间换上下文的取舍，不是待修的缺陷。
