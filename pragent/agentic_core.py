@@ -505,6 +505,10 @@ class AgenticReviewer(Reviewer):
             "repository_context": {
                 "available": suite.repository_available,
                 "root_supplied": bool(root),
+                **(
+                    suite.source.describe() if suite.source is not None
+                    else {"source_kind": "", "file_count": None}
+                ),
             },
             "context_management": context_management,
         }

@@ -11,14 +11,16 @@ import sys
 import tempfile
 import shlex
 import time
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from .diff_parser import ParsedDiff
+from .repository_source import SKIP_DIRS, RepositorySource, coerce_source
 from .runtime import AgentTool, ToolRegistry
 from .telemetry import ExecutionLedger
 
 
-SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "dist", "build", ".venv", "venv"}
+# Tools that need no repository content at all: they answer from the diff.
+SOURCE_FREE_TOOLS = {"search_diff", "changed_line"}
 CONFIG_NAMES = {
     "package.json", "package-lock.json", "requirements.txt", "pyproject.toml",
     "poetry.lock", "Pipfile", "Dockerfile", "docker-compose.yml", ".github",
@@ -39,12 +41,16 @@ def _evidence(tool: str, payload: Any) -> Dict[str, Any]:
 
 class RepositoryToolSuite:
     def __init__(
-        self, root: str, diff: str, parsed: ParsedDiff,
+        self, source=None, diff: str = "", parsed: Optional[ParsedDiff] = None,
         ledger: Optional[ExecutionLedger] = None,
         test_command: str = "",
     ):
-        candidate = os.path.abspath(root) if root else ""
-        self.root = candidate if candidate and os.path.isdir(candidate) else ""
+        """``source`` accepts a RepositorySource, a directory path, or nothing.
+
+        A directory string keeps working so existing callers and tests do not
+        have to know about the new interface.
+        """
+        self.source: Optional[RepositorySource] = coerce_source(source)
         self.diff = diff
         self.parsed = parsed
         self.ledger = ledger
@@ -52,7 +58,16 @@ class RepositoryToolSuite:
 
     @property
     def repository_available(self) -> bool:
-        return bool(self.root)
+        return self.source is not None
+
+    @property
+    def root(self) -> str:
+        """Local directory backing this review, or "" when it has none yet.
+
+        Kept as a property because callers used to read the attribute; a
+        materialized source only builds its directory on first use.
+        """
+        return self.source.local_path() if self.source is not None else ""
 
     def _remember_evidence(
         self, tool: str, value: Any, arguments: Optional[Dict[str, Any]] = None,
@@ -71,30 +86,17 @@ class RepositoryToolSuite:
         self.ledger.record_evidence(str(evidence_id), tool, subject)
 
     def _safe_path(self, relative: str) -> str:
-        if not self.root:
-            raise ValueError("repository checkout is unavailable for this review")
-        relative = str(relative).replace("\\", "/").lstrip("/")
-        target = os.path.abspath(os.path.join(self.root, relative))
-        if target != self.root and not target.startswith(self.root + os.sep):
-            raise ValueError("path escapes repository root")
-        return target
+        if self.source is None:
+            raise ValueError("repository source is unavailable for this review")
+        return self.source.resolve(relative)
 
-    def _files(self) -> Iterable[str]:
-        if not self.root:
-            return []
-        values = []
-        for current, dirs, files in os.walk(self.root):
-            dirs[:] = [item for item in dirs if item not in SKIP_DIRS]
-            for name in files:
-                path = os.path.join(current, name)
-                try:
-                    if os.path.getsize(path) <= 2_000_000:
-                        values.append(os.path.relpath(path, self.root).replace("\\", "/"))
-                except OSError:
-                    continue
-                if len(values) >= 20_000:
-                    return values
-        return values
+    def _read_text(self, relative: str) -> str:
+        if self.source is None:
+            raise ValueError("repository source is unavailable for this review")
+        return self.source.read_text(relative)
+
+    def _files(self) -> List[str]:
+        return self.source.list_files() if self.source is not None else []
 
     def list_repository(self, limit: int = 500) -> dict:
         files = list(self._files())[:max(1, min(int(limit), 2000))]
@@ -110,14 +112,14 @@ class RepositoryToolSuite:
         hits = []
         for relative in self._files():
             try:
-                with open(self._safe_path(relative), "r", encoding="utf-8", errors="replace") as handle:
-                    for number, line in enumerate(handle, 1):
-                        if query.lower() in line.lower():
-                            hits.append({"path": relative, "line": number, "content": line.rstrip()[:500]})
-                            if len(hits) >= max(1, min(int(limit), 200)):
-                                return _evidence("search_repository", hits)
-            except OSError:
+                content = self._read_text(relative)
+            except (OSError, ValueError):
                 continue
+            for number, line in enumerate(content.splitlines(), 1):
+                if query.lower() in line.lower():
+                    hits.append({"path": relative, "line": number, "content": line.rstrip()[:500]})
+                    if len(hits) >= max(1, min(int(limit), 200)):
+                        return _evidence("search_repository", hits)
         return _evidence("search_repository", hits)
 
     def search_diff(self, query: str, limit: int = 50) -> dict:
@@ -134,9 +136,7 @@ class RepositoryToolSuite:
     def read_file(self, path: str, start_line: int = 1, end_line: int = 240) -> dict:
         start = max(1, int(start_line))
         end = min(max(start, int(end_line)), start + 499)
-        target = self._safe_path(path)
-        with open(target, "r", encoding="utf-8", errors="replace") as handle:
-            lines = handle.readlines()
+        lines = self._read_text(path).splitlines(keepends=True)
         payload = {
             "path": str(path), "start_line": start, "end_line": min(end, len(lines)),
             "content": "".join(lines[start - 1:end])[:40_000],
@@ -163,10 +163,9 @@ class RepositoryToolSuite:
             if not relative.endswith(".py"):
                 continue
             try:
-                target = self._safe_path(relative)
-                source = Path(target).read_text(encoding="utf-8", errors="replace")
+                source = self._read_text(relative)
                 tree = ast.parse(source, filename=relative)
-            except (OSError, SyntaxError):
+            except (OSError, ValueError, SyntaxError):
                 continue
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
@@ -216,10 +215,8 @@ class RepositoryToolSuite:
             parts = set(relative.split("/"))
             if Path(relative).name in CONFIG_NAMES or parts.intersection({".github", "config", "permissions"}):
                 try:
-                    content = Path(self._safe_path(relative)).read_text(
-                        encoding="utf-8", errors="replace"
-                    )[:20_000]
-                except OSError:
+                    content = self._read_text(relative)[:20_000]
+                except (OSError, ValueError):
                     continue
                 selected.append({"path": relative, "content": content})
                 if len(selected) >= 40:
@@ -227,8 +224,7 @@ class RepositoryToolSuite:
         return _evidence("read_project_controls", selected)
 
     def ast_analyze(self, path: str) -> dict:
-        target = self._safe_path(path)
-        source = Path(target).read_text(encoding="utf-8", errors="replace")
+        source = self._read_text(path)
         if str(path).endswith(".py"):
             try:
                 tree = ast.parse(source, filename=str(path))
@@ -258,8 +254,11 @@ class RepositoryToolSuite:
         })
 
     def git_context(self, path: str, line: int = 1) -> dict:
-        target = self._safe_path(path)
-        if not os.path.isdir(os.path.join(self.root, ".git")) or not shutil.which("git"):
+        # History needs a real checkout; a fetched file set has no .git.
+        if self.source is None or self.source.kind != "local-tree":
+            return _evidence("git_context", {"available": False, "path": path})
+        root = self.root
+        if not os.path.isdir(os.path.join(root, ".git")) or not shutil.which("git"):
             return _evidence("git_context", {"available": False, "path": path})
         commands = [
             ["git", "log", "-n", "8", "--format=%h%x09%ad%x09%s", "--date=short", "--", str(path)],
@@ -279,7 +278,7 @@ class RepositoryToolSuite:
 
     def run_scanners(self) -> dict:
         """Run installed, fixed-command analyzers. User input never becomes a command."""
-        if not self.root:
+        if self.source is None:
             return _evidence("run_scanners", {"available": False, "runs": []})
         specs = [
             ("semgrep", ["semgrep", "scan", "--config", "auto", "--json", "--quiet", "."]),
@@ -314,7 +313,7 @@ class RepositoryToolSuite:
         kind = str(kind).strip().lower()
         if kind not in {"compile", "tests"}:
             raise ValueError("kind must be compile or tests")
-        if not self.root:
+        if self.source is None:
             return _evidence("test", {"available": False, "kind": kind})
         if kind == "tests" and not self.test_command:
             return _evidence("test", {
@@ -421,9 +420,13 @@ class RepositoryToolSuite:
                 self.run_repository_checks,
             ),
         }
-        selected = allowed or set(specs)
+        selected = set(specs) if allowed is None else set(allowed).intersection(specs)
+        if self.source is None:
+            # Without repository content only the diff-local tools can answer.
+            # Registering the rest would just invite calls that must fail.
+            selected = selected.intersection(SOURCE_FREE_TOOLS)
         tools = []
-        for name in sorted(selected.intersection(specs)):
+        for name in sorted(selected):
             description, schema, handler = specs[name]
 
             def wrapped(_handler=handler, _name=name, **arguments):
