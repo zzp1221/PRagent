@@ -27,6 +27,98 @@ CONFIG_NAMES = {
     "CODEOWNERS", "Cargo.toml", "go.mod", "pom.xml", "build.gradle",
 }
 
+# Definition shapes differ too much between languages for one pattern to cover
+# them, so each family gets its own set. ``{name}`` is substituted literally.
+_JS_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte")
+_GO_EXTS = (".go",)
+_JVM_EXTS = (".java", ".kt", ".kts", ".scala")
+_RUBY_EXTS = (".rb",)
+_RUST_EXTS = (".rs",)
+_PHP_EXTS = (".php",)
+
+_DEFINITION_TEMPLATES = {
+    _JS_EXTS: (
+        r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*{name}\s*\(",
+        r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+{name}\b",
+        r"^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*=",
+        r"^\s*(?:export\s+)?(?:interface|type|enum)\s+{name}\b",
+    ),
+    _GO_EXTS: (
+        r"^\s*func\s+{name}\s*\(",
+        r"^\s*func\s*\([^)]*\)\s*{name}\s*\(",
+        r"^\s*type\s+{name}\s+(?:struct|interface)\b",
+    ),
+    _JVM_EXTS: (
+        r"^\s*(?:[\w@]+\s+)*(?:class|interface|enum|record|object)\s+{name}\b",
+        r"^\s*(?:[\w@]+\s+)+[\w<>\[\],.\s]+?\s+{name}\s*\(",
+    ),
+    _RUBY_EXTS: (
+        r"^\s*def\s+(?:self\.)?{name}\b",
+    ),
+    _RUST_EXTS: (
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+{name}\b",
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|union)\s+{name}\b",
+    ),
+    _PHP_EXTS: (
+        r"^\s*(?:[\w]+\s+)*function\s+{name}\s*\(",
+    ),
+}
+
+
+def _definition_templates(extension: str) -> tuple:
+    for extensions, templates in _DEFINITION_TEMPLATES.items():
+        if extension in extensions:
+            return templates
+    return ()
+
+
+def _compiled_definitions(name: str, extension: str) -> List[Any]:
+    escaped = re.escape(name)
+    return [
+        re.compile(template.replace("{name}", escaped))
+        for template in _definition_templates(extension)
+    ]
+
+
+def _call_name(node) -> str:
+    """The bare name a call goes through, ignoring the receiver object."""
+    func = getattr(node, "func", None)
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return ""
+
+
+def _imported_names(tree) -> Set[str]:
+    """Names this module brings into scope, including aliases."""
+    names: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+    return names
+
+
+def _caller_scope(
+    file_defs: Dict[str, Set[str]], file_imports: Dict[str, Set[str]],
+    path: str, name: str,
+) -> str:
+    """Whether a call site can be tied to the same symbol.
+
+    ``local`` means the same file defines it, ``imported`` means the file brings
+    that name into scope. Everything else is a plain text hit that may be a
+    different function sharing the name.
+    """
+    if name in file_defs.get(path, set()):
+        return "local"
+    if name in file_imports.get(path, set()):
+        return "imported"
+    return "unresolved"
+
 
 def _evidence(tool: str, payload: Any) -> Dict[str, Any]:
     rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -158,39 +250,80 @@ class RepositoryToolSuite:
         name = str(name).strip()
         if not name:
             raise ValueError("symbol name is required")
-        definitions, callers, callees = [], [], []
+        definitions: List[Dict[str, Any]] = []
+        callers: List[Dict[str, Any]] = []
+        callees: List[Dict[str, Any]] = []
+        file_defs: Dict[str, Set[str]] = {}
+        file_imports: Dict[str, Set[str]] = {}
         for relative in self._files():
-            if not relative.endswith(".py"):
+            extension = os.path.splitext(relative)[1].lower()
+            if extension != ".py" and not _definition_templates(extension):
                 continue
             try:
                 source = self._read_text(relative)
-                tree = ast.parse(source, filename=relative)
-            except (OSError, ValueError, SyntaxError):
+            except (OSError, ValueError):
                 continue
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
-                    definitions.append({"path": relative, "line": node.lineno, "kind": type(node).__name__})
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        for child in ast.walk(node):
-                            if isinstance(child, ast.Call):
-                                called = (
-                                    child.func.id if isinstance(child.func, ast.Name)
-                                    else child.func.attr if isinstance(child.func, ast.Attribute) else ""
-                                )
-                                if called:
-                                    callees.append({"path": relative, "line": child.lineno, "symbol": called})
-                if isinstance(node, ast.Call):
-                    called = (
-                        node.func.id if isinstance(node.func, ast.Name)
-                        else node.func.attr if isinstance(node.func, ast.Attribute) else ""
-                    )
-                    if called == name:
+            if extension == ".py":
+                try:
+                    tree = ast.parse(source, filename=relative)
+                except SyntaxError:
+                    continue
+                file_defs[relative] = {
+                    node.name for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                }
+                file_imports[relative] = _imported_names(tree)
+                for node in ast.walk(tree):
+                    if (
+                        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                        and node.name == name
+                    ):
+                        definitions.append({
+                            "path": relative, "line": node.lineno,
+                            "kind": type(node).__name__, "confidence": "exact",
+                        })
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            for child in ast.walk(node):
+                                if isinstance(child, ast.Call):
+                                    called = _call_name(child)
+                                    if called:
+                                        callees.append({
+                                            "path": relative, "line": child.lineno,
+                                            "symbol": called,
+                                        })
+                    if isinstance(node, ast.Call) and _call_name(node) == name:
                         callers.append({"path": relative, "line": node.lineno})
+            else:
+                patterns = _compiled_definitions(name, extension)
+                reference = re.compile(r"\b" + re.escape(name) + r"\b")
+                for number, line in enumerate(source.splitlines(), 1):
+                    text = line[:500]
+                    if any(item.search(text) for item in patterns):
+                        definitions.append({
+                            "path": relative, "line": number,
+                            "kind": "declaration", "confidence": "heuristic",
+                        })
+                    elif reference.search(text):
+                        callers.append({"path": relative, "line": number})
             if len(definitions) + len(callers) > 300:
                 break
+        for item in callers:
+            item["scope"] = _caller_scope(
+                file_defs, file_imports, str(item.get("path", "")), name,
+            )
+        exact = sum(1 for item in definitions if item.get("confidence") == "exact")
         return _evidence("symbol", {
-            "symbol": name, "definitions": definitions[:100],
-            "callers": callers[:100], "callees": callees[:100],
+            "symbol": name,
+            "definitions": definitions[:100],
+            "callers": callers[:100],
+            "callees": callees[:100],
+            "summary": {
+                "exact_definitions": exact,
+                "heuristic_definitions": len(definitions) - exact,
+                "unresolved_callers": sum(
+                    1 for item in callers if item.get("scope") == "unresolved"
+                ),
+            },
         })
 
     def locate_tests(self, path: str = "", symbol: str = "") -> dict:

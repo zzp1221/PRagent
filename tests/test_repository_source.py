@@ -165,7 +165,7 @@ class ToolSuiteSourceTests(unittest.TestCase):
         registry = suite.registry("security")
         symbol = registry.invoke("symbol", {"name": "helper"})
         self.assertEqual(
-            [{"path": "a.py", "line": 1, "kind": "FunctionDef"}],
+            [{"path": "a.py", "line": 1, "kind": "FunctionDef", "confidence": "exact"}],
             symbol["output"]["definitions"],
         )
         analyzed = registry.invoke("ast_analyze", {"path": "a.py"})
