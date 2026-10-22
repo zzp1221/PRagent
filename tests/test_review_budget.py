@@ -83,6 +83,66 @@ class ToolFirstWorkerClient(RecordingClient):
         return {"action": "final", "findings": []}
 
 
+class CriticLookupClient(RecordingClient):
+    """Critic that insists on two verification lookups before deciding."""
+
+    def complete_json(self, role, system, user, ledger=None, max_tokens=None):
+        if role != "critic":
+            return super().complete_json(role, system, user, ledger, max_tokens)
+        managed = json.loads(user)
+        task = json.loads(managed["task"])
+        self.calls.append({
+            "role": role, "phase": "critic",
+            "tools": len(managed.get("available_tools") or []),
+            "instruction": str(task.get("instruction", "")),
+        })
+        if ledger:
+            ledger.record_model(
+                role, self.provider, self.model,
+                {"prompt_tokens": 10, "completion_tokens": 5}, 1,
+            )
+        observations = managed.get("observations") or []
+        if len(observations) < 2:
+            return {
+                "action": "tool", "tool": "read_file",
+                "arguments": {"path": "a.py", "start_line": 1, "end_line": 40},
+            }
+        return {
+            "action": "final",
+            "decisions": [
+                {
+                    "finding_index": index, "accepted": True, "objections": [],
+                    "confidence_adjustment": 0.0,
+                }
+                for index, _ in enumerate(task["candidates"])
+            ],
+        }
+
+
+class CriticForeverClient(RecordingClient):
+    """Critic that never stops asking for lookups."""
+
+    def complete_json(self, role, system, user, ledger=None, max_tokens=None):
+        if role != "critic":
+            return super().complete_json(role, system, user, ledger, max_tokens)
+        managed = json.loads(user)
+        task = json.loads(managed["task"])
+        self.calls.append({
+            "role": role, "phase": "critic",
+            "tools": len(managed.get("available_tools") or []),
+            "instruction": str(task.get("instruction", "")),
+        })
+        if ledger:
+            ledger.record_model(
+                role, self.provider, self.model,
+                {"prompt_tokens": 10, "completion_tokens": 5}, 1,
+            )
+        return {
+            "action": "tool", "tool": "read_file",
+            "arguments": {"path": "a.py", "start_line": 1, "end_line": 10},
+        }
+
+
 class ReviewBudgetUnitTests(unittest.TestCase):
     def _ledger(self, calls=0):
         ledger = ExecutionLedger("agentic")
@@ -195,6 +255,26 @@ class DepthPolicyTests(unittest.TestCase):
         critic_calls = [item for item in calls if item["role"] == "critic"]
         self.assertEqual(1, len(critic_calls))
         self.assertEqual(0, critic_calls[0]["tools"])
+
+    def test_critic_can_verify_twice_before_deciding(self):
+        # Two proof-carrying lookups plus the decision is three steps; a two-step
+        # ceiling raised "critic step budget exhausted" on a real 29-file PR.
+        client = CriticLookupClient(findings=[UNEVIDENCED])
+        calls = self._run(client, repository_root=True)
+        critic_calls = [item for item in calls if item["role"] == "critic"]
+        self.assertEqual(3, len(critic_calls))
+        # The two verification steps see tools; the final one must answer.
+        self.assertTrue(all(item["tools"] > 0 for item in critic_calls[:2]))
+        self.assertEqual(0, critic_calls[-1]["tools"])
+
+    def test_a_critic_that_never_stops_degrades_instead_of_failing(self):
+        # Running out of steps must not kill a review that already has other
+        # roles' results. The last step offers no tools, so the role answers.
+        client = CriticForeverClient(findings=[UNEVIDENCED])
+        calls = self._run(client, repository_root=True)
+        critic_calls = [item for item in calls if item["role"] == "critic"]
+        self.assertEqual(3, len(critic_calls))
+        self.assertEqual(0, critic_calls[-1]["tools"])
 
 
 class ReviewBudgetIntegrationTests(unittest.TestCase):

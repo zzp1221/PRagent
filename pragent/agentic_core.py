@@ -139,6 +139,7 @@ class BoundedRole:
         context_manager: Optional[ContextManager] = None,
         working_memory_supplier=None, observation_sink=None,
         max_output_tokens: int = 4000, budget=None,
+        degrade_on_exhaustion: bool = False,
     ):
         self.name = name
         self.prompt = prompt
@@ -146,6 +147,10 @@ class BoundedRole:
         self.token_budget = token_budget
         self.time_budget = time_budget
         self.max_steps = max_steps
+        # A worker or critic that runs out of steps still owes the Lead a result;
+        # only the role whose absence would leave the review unwritten (the Lead)
+        # treats exhaustion as fatal.
+        self.degrade_on_exhaustion = degrade_on_exhaustion
         # Review-wide ceiling; per-role budgets cannot bound the whole review.
         self.budget = budget
         self.context_manager = context_manager or ContextManager()
@@ -197,8 +202,11 @@ class BoundedRole:
                     ledger.trace(
                         self.name, "working_memory_unavailable", error=str(exc)[:500],
                     )
+            # The final step must conclude: with no tools on offer the model can
+            # only answer, which is what a step ceiling is meant to force.
+            visible_tools = [] if step >= self.max_steps else tools.catalog()
             managed, context_stats = self.context_manager.build_managed_context(
-                current_context, tools.catalog(), observations,
+                current_context, visible_tools, observations,
                 max(0, self.token_budget - used),
                 max(0, int(self.time_budget - elapsed)),
                 system_prompt=self.prompt, max_output_tokens=output_allowance,
@@ -270,6 +278,17 @@ class BoundedRole:
                 self.name, "tool_observation", step=step, tool=tool_name,
                 ok=observation["ok"],
             )
+        if self.degrade_on_exhaustion:
+            # Answer from what was already gathered instead of killing a review
+            # that has other roles' results to report.
+            ledger.trace(
+                self.name, "budget_exhausted", budget="steps", degraded=True,
+                observations=len(observations),
+            )
+            return {
+                "action": "final", "_degraded": True, "_steps": self.max_steps,
+                "_observations": observations,
+            }
         ledger.trace(self.name, "budget_exhausted", budget="steps")
         raise RuntimeBudgetExceeded("%s step budget exhausted" % self.name)
 
@@ -331,6 +350,7 @@ class AgenticReviewer(Reviewer):
         review_token_budget: int = 0,
         review_time_budget_seconds: int = 0,
         review_max_model_calls: int = 0,
+        repository_source_provider=None,
     ):
         self.store = store
         self.client = llm_client
@@ -351,6 +371,7 @@ class AgenticReviewer(Reviewer):
         self.memory_manager = memory_manager
         self.context_manager = context_manager or ContextManager()
         self.skill_provider = skill_provider
+        self.repository_source_provider = repository_source_provider
         if self.structured_config:
             self.prompt_overlay += "\nStructured runtime policy:\n" + json.dumps(
                 self.structured_config, ensure_ascii=False, sort_keys=True
@@ -442,7 +463,26 @@ class AgenticReviewer(Reviewer):
         root = str(task_input.get("repository_root") or "")
         if not root and os.path.isdir(repository):
             root = repository
-        suite = RepositoryToolSuite(root, diff, parsed, ledger, self.review_test_command)
+        source = root or None
+        if not source and self.repository_source_provider is not None:
+            # Webhook and polled reviews have no checkout; fetch the files this
+            # diff touches before the workers start asking for them.
+            try:
+                source = self.repository_source_provider(
+                    tenant_id, repository, task_input, parsed,
+                )
+            except Exception as exc:
+                ledger.trace(
+                    "repository-source", "fetch_failed", error=str(exc)[:1000],
+                )
+                source = None
+            else:
+                ledger.trace(
+                    "repository-source", "fetched",
+                    available=source is not None,
+                    files=len(source.list_files()) if source is not None else 0,
+                )
+        suite = RepositoryToolSuite(source, diff, parsed, ledger, self.review_test_command)
         enabled = set(task_input.get("enabled_agents") or self.enabled_roles)
         scanners = self.scanners + (
             list(self.scanner_provider(tenant_id)) if self.scanner_provider else []
@@ -505,6 +545,10 @@ class AgenticReviewer(Reviewer):
             "repository_context": {
                 "available": suite.repository_available,
                 "root_supplied": bool(root),
+                **(
+                    suite.source.describe() if suite.source is not None
+                    else {"source_kind": "", "file_count": None}
+                ),
             },
             "context_management": context_management,
         }
@@ -738,7 +782,10 @@ class AgenticReviewer(Reviewer):
                 diff, candidates,
                 str(final_assessment.get("critic_objective", "")),
                 suite, ledger, task_id, memory_context,
-                max_steps=2 if critic_tools else 1,
+                # With a source available the critic can look things up, and one
+                # lookup is not enough to challenge anything: it needs room for
+                # two verification queries plus the final decision.
+                max_steps=3 if critic_tools else 1,
                 allow_tools=critic_tools,
             )
             candidates, decisions = self._apply_critic(critic_result, candidates)
@@ -976,6 +1023,7 @@ class AgenticReviewer(Reviewer):
             observation_sink=observation_sink,
             max_output_tokens=self.max_output_tokens,
             budget=self._budget_for(context_key),
+            degrade_on_exhaustion=True,
         )
         return role.run(
             json.dumps({
@@ -1041,6 +1089,7 @@ class AgenticReviewer(Reviewer):
                 observation_sink=observation_sink,
                 max_output_tokens=self.max_output_tokens,
                 budget=budget,
+                degrade_on_exhaustion=True,
             )
             context = {
                 "lead_assignment": assignment,

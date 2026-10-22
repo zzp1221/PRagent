@@ -149,6 +149,17 @@ class ExecutionLedger:
             traces = {key: list(value) for key, value in self.agent_traces.items()}
             evidence = dict(self.evidence)
             subjects = dict(self.evidence_subjects)
+        # A role that ran out of steps still answered from partial observations.
+        # That must be visible in the report, not only in the trace.
+        degraded_roles = sorted({
+            str(role) for role, events in traces.items()
+            if any(
+                isinstance(item, dict)
+                and item.get("event") == "budget_exhausted"
+                and item.get("degraded")
+                for item in events
+            )
+        })
         return {
             "mode": self.mode,
             "llm_calls": len(models),
@@ -166,5 +177,6 @@ class ExecutionLedger:
             "tool_call_log": tools,
             "evidence": evidence,
             "evidence_subjects": subjects,
+            "degraded_roles": degraded_roles,
             "agent_traces": traces if include_trace else {},
         }

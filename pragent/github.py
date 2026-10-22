@@ -37,6 +37,17 @@ class GitHubClient:
         )
         return body.decode("utf-8", errors="replace")
 
+    def fetch_file(self, repository: str, path: str, ref: str = "") -> str:
+        """Read one file at an exact revision, so it cannot drift from the diff."""
+        quoted = urllib.parse.quote(str(path).lstrip("/"), safe="/")
+        url = "https://api.github.com/repos/%s/contents/%s" % (repository, quoted)
+        if ref:
+            url += "?ref=" + urllib.parse.quote(str(ref), safe="")
+        body = self._request(
+            "GET", url, accept="application/vnd.github.raw", raw=True
+        )
+        return body.decode("utf-8", errors="replace")
+
     def post_comment(self, api_url: str, markdown: str) -> None:
         url = api_url.rstrip("/") + "/comments"
         request = urllib.request.Request(

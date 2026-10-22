@@ -142,6 +142,12 @@ class Settings:
     agent_review_token_budget: int = 0
     agent_review_time_budget_seconds: int = 0
     agent_review_max_model_calls: int = 0
+    # Webhook and polled reviews have no checkout. Reading the files this diff
+    # touches is what lets the source-backed tools work there at all.
+    repository_source_enabled: bool = True
+    repository_source_max_files: int = 40
+    repository_source_max_file_bytes: int = 300_000
+    repository_source_max_total_bytes: int = 2_000_000
 
     def resolved_review_budget(self) -> Dict[str, int]:
         """Derive the review-wide ceiling when it is not set explicitly."""
@@ -157,6 +163,17 @@ class Settings:
             ),
             "review_max_model_calls": self.agent_review_max_model_calls,
         }
+
+    def resolved_runtime_timeout(self) -> int:
+        """Framework hard kill must outlive the review's own time budget.
+
+        Otherwise the runtime aborts first with no reason and the soft ceiling
+        that reports "seconds X/Y" never gets a chance to explain itself.
+        """
+        budget = self.resolved_review_budget()["review_time_budget_seconds"]
+        # The extra minute covers the unwind: worker threads, trace writes and
+        # the state transition that turns the soft ceiling into a clear error.
+        return max(int(self.timeout_seconds), int(budget) + 60)
 
     def resolved_llm(self) -> Dict[str, object]:
         """Resolve a named provider to the existing OpenAI-compatible transport."""
@@ -366,5 +383,17 @@ class Settings:
             ),
             agent_review_max_model_calls=_non_negative_int(
                 "PRAGENT_AGENT_REVIEW_MAX_MODEL_CALLS", 0
+            ),
+            repository_source_enabled=_bool(
+                "PRAGENT_REPOSITORY_SOURCE_ENABLED", True
+            ),
+            repository_source_max_files=_int(
+                "PRAGENT_REPOSITORY_SOURCE_MAX_FILES", 40
+            ),
+            repository_source_max_file_bytes=_int(
+                "PRAGENT_REPOSITORY_SOURCE_MAX_FILE_BYTES", 300_000
+            ),
+            repository_source_max_total_bytes=_int(
+                "PRAGENT_REPOSITORY_SOURCE_MAX_TOTAL_BYTES", 2_000_000
             ),
         )
