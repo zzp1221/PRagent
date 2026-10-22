@@ -20,6 +20,7 @@ from .models import TaskState, TraceEvent
 from .observability import AlertManager, Observability
 from .postgres_store import create_store
 from .report import to_markdown
+from .repository_source import PinnedFiles
 from .reviewer import (
     OpenAICompatibleReviewer, ReliabilityRuleReviewer, SecurityRuleReviewer,
 )
@@ -258,8 +259,61 @@ class ReviewService:
             self.context_manager,
             self._active_agent_skills,
             active.agent_max_output_tokens,
+            repository_source_provider=self._repository_source_provider,
             **active.resolved_review_budget(),
         )
+
+    def _repository_source_provider(
+        self, tenant_id: str, repository: str, task_input: Dict[str, Any],
+        parsed=None,
+    ):
+        """Fetch this diff's files so source-backed tools work without a checkout.
+
+        Only paths already listed in the diff are fetched, so a worker cannot
+        steer the server toward arbitrary repository content.
+        """
+        settings = self.effective_settings
+        if not settings.repository_source_enabled:
+            return None
+        paths = [str(item) for item in (getattr(parsed, "files", None) or [])]
+        if not paths:
+            return None
+        values = task_input or {}
+        ref = str(values.get("head_sha") or "")
+        if not ref:
+            # Without the reviewed commit the fetched bytes may disagree with
+            # the diff. Refusing to fetch is safer than reviewing a mix.
+            return None
+        installation_id = values.get("installation_id")
+        if installation_id is None and not str(settings.github_token or "").strip():
+            # No credential: every request would fail anyway, so do not start
+            # a review by paying for a guaranteed 401.
+            return None
+        try:
+            client = self.github_client_for_installation(installation_id)
+        except Exception:
+            return None
+        wanted = list(dict.fromkeys(paths))[
+            :max(1, int(settings.repository_source_max_files))
+        ]
+        files: Dict[str, str] = {}
+        total = 0
+        for path in wanted:
+            try:
+                content = client.fetch_file(repository, path, ref)
+            except Exception:
+                continue
+            if "\x00" in content:
+                # Binary content is not something a review can reason about.
+                continue
+            size = len(content.encode("utf-8"))
+            if size > int(settings.repository_source_max_file_bytes):
+                continue
+            if total + size > int(settings.repository_source_max_total_bytes):
+                break
+            files[path] = content
+            total += size
+        return PinnedFiles(files) if files else None
 
     def _run_review(
         self, task_id: str, repository: str, pull_request: Optional[int],

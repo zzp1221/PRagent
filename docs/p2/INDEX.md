@@ -12,8 +12,8 @@
 
 | 步骤 | 主题 | 提交 |
 |---|---|---|
-| step1 | 仓库源抽象：`RepositorySource` / `LocalTree` / `PinnedFiles`，无源时收起 10 个工具 | 见下 |
-| step2 | 远程取文件：GitHub contents API + service 层 provider，webhook 路径首次获得文件内容 | |
+| step1 | 仓库源抽象：`RepositorySource` / `LocalTree` / `PinnedFiles`，无源时收起 10 个工具 | `dc7c068` |
+| step2 | 远程取文件：GitHub contents API + service 层 provider，webhook 路径首次获得文件内容 | 见下 |
 | step3 | `symbol` 在冻结集上做对：import 关系过滤，消除同名碰撞 | |
 | step4 | 文案诚实化 + 全量回归 + 真实 PR 端到端验证 | |
 
@@ -27,6 +27,14 @@
 账本也不再堆积 `repository checkout is unavailable` 的失败观测。
 附带修正 `selected = allowed or set(specs)` 在 `allowed` 为空集时被当作「未传」的缺陷。
 
+**step2**：`GitHubClient.fetch_file` 用 contents API 的 raw 形态读单文件；
+`service._repository_source_provider` 按 `parsed.files` 取本次 diff 涉及的文件，
+构造函数级 `PinnedFiles` 交给工具套件。webhook 与轮询路径第一次真正拿到了文件内容，
+`repository_context.source_kind` 变为 `pinned-files`。三重上限（40 个文件 / 300KB 单文件 /
+2MB 总量）与二进制跳过保证取文件的边界可控；单文件失败跳过，全失败退回 step1 行为。
+两道前置检查是实施中补的：没有 `head_sha` 就拒绝取（避免 diff 与文件版本不一致），
+没有凭据就不发请求（避免每次审查付一次必然 401 的往返）。
+
 ## 回归基线
 
 ```
@@ -35,12 +43,14 @@ python -c "import sys,pathlib,unittest; sys.path.insert(0,'.'); sys.path.insert(
   unittest.TextTestRunner(verbosity=1).run(unittest.TestLoader().loadTestsFromNames(names))"
 ```
 
-step1 完成时：**199 用例，0 失败 0 错误**（进入 P2 前的真实基线 176，step1 新增 23）。
+step1 完成时：**199 用例，0 失败 0 错误**。
+step2 完成时：**215 用例，0 失败 0 错误**。
 
 ## 仍然存在的边界
 
-- **step1 之后主路径仍然没有内容**：`PinnedFiles` 已经能用，但还没有任何代码去填充它。
-  Webhook 与轮询路径的 `repository_context.available` 依旧是 `false`，只是现在失败会以
-  「工具根本不出现在 schema 里」的形式呈现，而不是十二个调用里十个报错。
 - **`file_count` 对 `LocalTree` 为 `None`**：枚举目录是 `os.walk` 全遍历，不在报告里重复付费。
 - **`symbol` 仍然只对 `.py` 生效**：这是 step3 的范围。
+- **冻结集只含被改文件，不含其调用方**：跨文件因果推理需要「谁调用了这个函数」，
+  那属于第二圈扩张，不在本方向。step2 解决的是「被改的这几个文件看不全」。
+- **`git_context` 在远程形态下永远不可用**：contents API 不提供 blame 与提交历史。
+

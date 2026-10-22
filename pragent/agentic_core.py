@@ -331,6 +331,7 @@ class AgenticReviewer(Reviewer):
         review_token_budget: int = 0,
         review_time_budget_seconds: int = 0,
         review_max_model_calls: int = 0,
+        repository_source_provider=None,
     ):
         self.store = store
         self.client = llm_client
@@ -351,6 +352,7 @@ class AgenticReviewer(Reviewer):
         self.memory_manager = memory_manager
         self.context_manager = context_manager or ContextManager()
         self.skill_provider = skill_provider
+        self.repository_source_provider = repository_source_provider
         if self.structured_config:
             self.prompt_overlay += "\nStructured runtime policy:\n" + json.dumps(
                 self.structured_config, ensure_ascii=False, sort_keys=True
@@ -442,7 +444,26 @@ class AgenticReviewer(Reviewer):
         root = str(task_input.get("repository_root") or "")
         if not root and os.path.isdir(repository):
             root = repository
-        suite = RepositoryToolSuite(root, diff, parsed, ledger, self.review_test_command)
+        source = root or None
+        if not source and self.repository_source_provider is not None:
+            # Webhook and polled reviews have no checkout; fetch the files this
+            # diff touches before the workers start asking for them.
+            try:
+                source = self.repository_source_provider(
+                    tenant_id, repository, task_input, parsed,
+                )
+            except Exception as exc:
+                ledger.trace(
+                    "repository-source", "fetch_failed", error=str(exc)[:1000],
+                )
+                source = None
+            else:
+                ledger.trace(
+                    "repository-source", "fetched",
+                    available=source is not None,
+                    files=len(source.list_files()) if source is not None else 0,
+                )
+        suite = RepositoryToolSuite(source, diff, parsed, ledger, self.review_test_command)
         enabled = set(task_input.get("enabled_agents") or self.enabled_roles)
         scanners = self.scanners + (
             list(self.scanner_provider(tenant_id)) if self.scanner_provider else []
