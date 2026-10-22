@@ -163,6 +163,8 @@ PR 评论按同一 marker `<!-- pragent-review:zzp1221/PRagent#3 -->` upsert 更
   但没有做并发限流。
 - **A 型让审查变慢**：真实 PR 从「读 diff」变成「读 25-36 个文件、20+ 次工具调用」，
   耗时 95-126 秒。这是用时间换上下文的取舍，不是待修的缺陷。
-- **`degrade_on_exhaustion` 会产出没有 Critic 裁决的结果**：critic 万一耗尽，报告里
-  的 finding 就是未经挑战的候选。降级比整次失败好，但报告没有标注这一点，
-  目前只能从 trace 的 `budget_exhausted degraded=True` 看出来。
+- **`degrade_on_exhaustion` 产出的结果没有经过 Critic 裁决**：critic 万一耗尽，报告里的
+  finding 就是未经挑战的候选。降级比整次失败好，但结论强度确实弱一档。step8 已让这一点
+  可见：`execution.degraded_roles` 非空时，PR 评论的 Execution facts 会多出一行
+  `Degraded roles: ... (ran out of steps; their results are partial)`。
+  **仍未做的是**：把「有角色降级」升级成门禁条件或降低整体置信度，那需要真实数据支撑。

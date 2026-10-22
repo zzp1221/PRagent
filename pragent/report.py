@@ -38,6 +38,15 @@ def to_markdown(report: Dict[str, Any]) -> str:
         ])
         if run_mode.get("fallback_reason"):
             lines.extend(["> %s" % run_mode["fallback_reason"], ""])
+        degraded = execution.get("degraded_roles") or []
+        if degraded:
+            # A report that silently hides a partial role is worse than a failed
+            # review, because it still looks complete.
+            lines[-1:-1] = [
+                "- Degraded roles: `%s` "
+                "(ran out of steps; their results are partial)"
+                % ", ".join(str(item) for item in degraded)
+            ]
         context = execution.get("context_management") or {}
         if context:
             memory = context.get("memory_recall") or {}
