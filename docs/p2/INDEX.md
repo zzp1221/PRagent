@@ -18,7 +18,9 @@
 | step3 | `symbol` 多语言定义查找 + `confidence`/`scope` 标注 | `029748e` |
 | step4 | 文案诚实化 + 真实 PR 端到端验证 | `0167c2e` |
 | step5 | 框架超时不再先于审查预算触发 | `09b5324` |
-| step6 | Critic 拿到工具后退化为「看一眼就点头」 | `f7ece65` `2924aa0` |
+| step6 | Critic 拿到工具后退化为「看一眼就点头」 | `f7ece65` |
+| step7 | 最后一步不再暴露工具；步数耗尽降级而非杀死审查 | `2924aa0` |
+| step8 | 降级角色进入报告，不再只躺在 trace 里 | `d23ba71` |
 
 ## 解决了什么
 
@@ -68,6 +70,13 @@ Lead 保持致命语义，因为没有 Lead 的合成就没有报告。
 分两次提交是因为第二层不是「再多给一步」的延伸，而是把「耗尽」从致命错误改成降级语义 ——
 它同时改变 worker 的行为，值得单独可回滚。
 
+**step8**：降级不再静默。`ExecutionLedger.summary()` 从 `agent_traces` 推导出
+`degraded_roles`（只看 `budget_exhausted` 且 `degraded` 为真的记录，token/时间耗尽不算），
+`to_markdown()` 在非空时于 Execution facts 加一行
+`Degraded roles: ... (ran out of steps; their results are partial)`。
+这一步是被真实链路推着做的：第四轮验证时 PR 涨到 42 个文件、冻结集达到 40 的上限，
+security worker 自然耗尽步数而降级，报告却和正常完成一模一样。
+
 ## 回归基线
 
 ```
@@ -77,7 +86,7 @@ python -c "import sys,pathlib,unittest; sys.path.insert(0,'.'); sys.path.insert(
 ```
 
 进入 P2 前：176。step1 后 199。step2 后 215。step3 后 227。step4 后 227。
-step5 后 233。step6 后 **235，0 失败 0 错误**。
+step5 后 233。step6 后 235。step7 后 235。step8 后 **243，0 失败 0 错误**。
 
 ## 端到端验证（PR #3）
 
@@ -149,6 +158,31 @@ PR 评论已按 marker `<!-- pragent-review:zzp1221/PRagent#3 -->` 回写。
 产出仍是 2 条 medium finding，指向 provider 的宽泛 `except Exception`。
 PR 评论按同一 marker `<!-- pragent-review:zzp1221/PRagent#3 -->` upsert 更新，
 没有堆叠新评论。
+
+### 第四轮：42 文件，降级第一次真实发生并被报告
+
+任务 `2d2d4c49-4a38-414b-9956-13385c0ea9e1`，head `d23ba71`，**SUCCESS**，141 秒。
+
+diff 报 42 个文件，冻结集在 `repository_source_max_files = 40` 处封顶：
+
+```json
+{"available": true, "file_count": 40, "source_kind": "pinned-files", "root_supplied": false}
+"degraded_roles": "security"
+```
+
+security worker 想读的东西超过三步的空间，**真的耗尽并降级**，而审查照常完成、
+finding 照常产出。PR 评论因此第一次出现这一行：
+
+```
+- Degraded roles: `security` (ran out of steps; their results are partial)
+```
+
+不需要构造场景：A 型把冻结集撑到 40 个文件之后，worker 的步数上限自然会成为约束。
+step7 之前这种情况会打掉整次审查，step8 之前它虽然不打掉但完全不可见 ——
+审查看起来和正常完成没有区别。
+
+第四轮同时确认了 critic 的两次查证仍然生效（`read_file` + `search_repository` 各一次，
+均 `ok: true`），预算余量充足：`tokens_used=200034 / 288000`、`elapsed=140.5s / 480s`。
 
 ## 仍然存在的边界
 
