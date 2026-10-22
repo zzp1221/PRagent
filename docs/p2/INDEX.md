@@ -63,6 +63,11 @@ A 型之前 `critic_tools` 恒为假、critic 永远单步盲审；A 型之后�
 `_degraded` 结果，而不是抛 `RuntimeBudgetExceeded` 把一份已经有其他角色结果的审查打掉。
 Lead 保持致命语义，因为没有 Lead 的合成就没有报告。
 
+这两层分开记录：步数从 2 抬到 3 在 `docs/p2/step6-critic-steps/`，
+最后一步清空工具清单与 `degrade_on_exhaustion` 在 `docs/p2/step7-degrade-on-exhaustion/`。
+分两次提交是因为第二层不是「再多给一步」的延伸，而是把「耗尽」从致命错误改成降级语义 ——
+它同时改变 worker 的行为，值得单独可回滚。
+
 ## 回归基线
 
 ```
