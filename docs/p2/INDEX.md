@@ -56,6 +56,13 @@ A 型之前 `critic_tools` 恒为假、critic 永远单步盲审；A 型之后�
 冻结集，却只有「一次查询 + 一次回答」的空间，真实链路因此以
 `critic step budget exhausted` 失败过。
 
+只抬步数不够：一个坚持要工具的 critic 仍能在下一步撞死整次审查。所以加了两层结构保证。
+第一层是**最后一步不再暴露工具**（`visible_tools = [] if step >= max_steps`）——
+「最后一步必须出结论」从此是确定的，不再取决于模型是否听话。
+第二层是 `degrade_on_exhaustion`：worker 与 critic 万一仍然耗尽，就带着已有观测返回
+`_degraded` 结果，而不是抛 `RuntimeBudgetExceeded` 把一份已经有其他角色结果的审查打掉。
+Lead 保持致命语义，因为没有 Lead 的合成就没有报告。
+
 ## 回归基线
 
 ```
@@ -65,7 +72,7 @@ python -c "import sys,pathlib,unittest; sys.path.insert(0,'.'); sys.path.insert(
 ```
 
 进入 P2 前：176。step1 后 199。step2 后 215。step3 后 227。step4 后 227。
-step5 后 233。step6 后 **234，0 失败 0 错误**。
+step5 后 233。step6 后 **235，0 失败 0 错误**。
 
 ## 端到端验证（PR #3）
 
